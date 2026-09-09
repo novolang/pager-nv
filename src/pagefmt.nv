@@ -1,0 +1,214 @@
+// pagefmt.nv — the bytes at the front of the file, and at the front
+// of every log frame.
+//
+// Pure arithmetic over byte lists, with no `[fs]` anywhere in it.  The
+// module is in a `host` package because the FORMAT is the pager's —
+// nothing else in the grid has an opinion about what a database file's
+// header holds — but every function here could be `core` and is
+// written so that moving it later costs a manifest edit and nothing
+// else.  That also makes the format testable without a filesystem,
+// which is what `tests/pagefmt_tests.nv` does.
+//
+// THE DATABASE HEADER — page 1's first 48 bytes
+//
+//   bytes 0..3     magic, "NVPG"
+//   bytes 4..7     format version, big-endian u32
+//   bytes 8..11    page size in bytes, big-endian u32
+//   bytes 12..15   page count, big-endian u32
+//   bytes 16..19   first page of the free list, 0 for none
+//   bytes 20..23   free-list page count
+//   bytes 24..27   change counter, incremented at every commit
+//   bytes 28..31   schema cookie, incremented at every DDL statement
+//   bytes 32..35   the catalog's root page
+//   bytes 36..47   reserved, zero
+//
+// THE WAL HEADER — 32 bytes at the front of the log file
+//
+//   bytes 0..3     magic, "NVWL"
+//   bytes 4..7     format version, big-endian u32
+//   bytes 8..11    page size, which must equal the database's
+//   bytes 12..15   checkpoint sequence, incremented at every checkpoint
+//   bytes 16..19   salt 1, changed at every checkpoint
+//   bytes 20..23   salt 2, random at every checkpoint
+//   bytes 24..27   checksum 1 over bytes 0..23
+//   bytes 28..31   checksum 2 over bytes 0..23
+//
+// A WAL FRAME HEADER — 24 bytes, then one page of content
+//
+//   bytes 0..3     the page id this frame holds
+//   bytes 4..7     the database size in pages after this frame, or 0
+//                  when the frame is not a commit
+//   bytes 8..11    salt 1, copied from the WAL header
+//   bytes 12..15   salt 2, copied from the WAL header
+//   bytes 16..19   checksum 1, over the running total and this frame
+//   bytes 20..23   checksum 2
+//
+// THE SALTS ARE THE POINT OF THE WAL DESIGN, so they are worth
+// stating rather than leaving to be inferred: a frame whose salts do
+// not match the header's is a frame from BEFORE the last checkpoint,
+// left in the file because the log is written in place and never
+// truncated.  That is what makes a checkpoint O(1) at the end and what
+// makes recovery a forward scan that stops by itself.
+//
+// WHAT THIS IS NOT DERIVED FROM
+//
+// novodb has no write-ahead log.  Its `pagefile.nv` writes a whole
+// image and its v2 format appends a NEW image and moves an offset in
+// an outer header, with recovery by scanning the file for valid image
+// offsets and taking the last one before a limit.  That is a
+// log-structured file, not a WAL: it is crash-safe, and it rewrites
+// everything on every commit.  The frame format above is designed here
+// against SQLite's, which is the reference the must-have plan names.
+
+// The 48-byte database header, decoded.
+pub struct DbHeader
+    version: Int
+    page_size: Int
+    page_count: Int
+    freelist_head: Int
+    freelist_count: Int
+    // Incremented at every commit.  A reader that cached pages checks
+    // this before trusting them, which is the cheapest staleness
+    // detector there is.
+    change_counter: Int
+    // Incremented at every DDL statement.  A prepared statement holds
+    // the value it was planned against and is re-prepared when it
+    // moves, because a plan outliving its schema is how a query
+    // silently reads the wrong column.
+    schema_cookie: Int
+    catalog_root: Int
+
+// The 32-byte WAL header, decoded.
+pub struct WalHeader
+    version: Int
+    page_size: Int
+    checkpoint_seq: Int
+    salt1: Int
+    salt2: Int
+    checksum1: Int
+    checksum2: Int
+
+// A 24-byte WAL frame header, decoded.
+pub struct WalFrame
+    page_id: Int
+    // The database size in pages after this frame, or 0 when the frame
+    // is not the last of a transaction.  A non-zero value IS the
+    // commit record: there is no separate one.
+    db_size_after: Int
+    salt1: Int
+    salt2: Int
+    checksum1: Int
+    checksum2: Int
+
+// The size of the database header in bytes.
+pub fn db_header_size() -> Int
+    todo("pager-nv.pagefmt.db_header_size")
+
+// The size of the WAL header in bytes.
+pub fn wal_header_size() -> Int
+    todo("pager-nv.pagefmt.wal_header_size")
+
+// The size of a WAL frame header in bytes.
+pub fn wal_frame_header_size() -> Int
+    todo("pager-nv.pagefmt.wal_frame_header_size")
+
+// The default page size for a file this pager creates.
+//
+// 4096, which is btree-nv's `nodefmt.page_size()` and every
+// filesystem's block size.  A file may declare another in its header
+// and this pager will read it; it writes this one.
+pub fn default_page_size() -> Int
+    todo("pager-nv.pagefmt.default_page_size")
+
+// A fresh database header for an empty file.
+pub fn new_db_header(page_size: Int) -> DbHeader
+    todo("pager-nv.pagefmt.new_db_header")
+
+// Write the database header out.
+//
+// Returns exactly `db_header_size()` bytes.
+pub fn encode_db_header(h: DbHeader) -> [Int]
+    todo("pager-nv.pagefmt.encode_db_header")
+
+// Read the database header, or say why the bytes are not one.
+pub fn decode_db_header(bytes: [Int]) -> Result<DbHeader, FormatError>
+    todo("pager-nv.pagefmt.decode_db_header")
+
+// Write the WAL header out.
+//
+// The two checksums are computed over the first 24 bytes and written
+// into the last 8, so the returned header is self-consistent and
+// `decode_wal_header` will accept it.
+pub fn encode_wal_header(h: WalHeader) -> [Int]
+    todo("pager-nv.pagefmt.encode_wal_header")
+
+// Read the WAL header, checking both checksums.
+pub fn decode_wal_header(bytes: [Int]) -> Result<WalHeader, FormatError>
+    todo("pager-nv.pagefmt.decode_wal_header")
+
+// Write a frame header out, given the running checksum before it.
+//
+// The checksum is CUMULATIVE — see `checksum` — so a frame cannot be
+// written without knowing what came before it, and that is what makes
+// a frame inserted into the middle of a log detectable.
+pub fn encode_wal_frame(f: WalFrame, page: [Int], running: Checksum) -> [Int]
+    todo("pager-nv.pagefmt.encode_wal_frame")
+
+// Read a frame header, checking it against the running checksum.
+pub fn decode_wal_frame(bytes: [Int], page: [Int],
+                        running: Checksum) -> Result<WalFrame, FormatError>
+    todo("pager-nv.pagefmt.decode_wal_frame")
+
+// A running checksum: two 32-bit halves.
+pub struct Checksum
+    s1: Int
+    s2: Int
+
+// The checksum the WAL starts from, seeded by the header's salts.
+pub fn checksum_seed(h: WalHeader) -> Checksum
+    todo("pager-nv.pagefmt.checksum_seed")
+
+// Fold a run of bytes into the running checksum.
+//
+// SQLite's rolling pair — `s1 += x + s2; s2 += x + s1` over 32-bit
+// big-endian words, both halves truncated to 32 bits — chosen because
+// it is the reference implementation's and because it is cumulative:
+// a checksum over one frame alone would not notice a frame lifted out
+// of another log and dropped in, and this one does.
+pub fn checksum(running: Checksum, bytes: [Int]) -> Checksum
+    todo("pager-nv.pagefmt.checksum")
+
+// True when a frame's salts match this WAL header's.
+//
+// A frame that does not is a frame from before the last checkpoint,
+// left in the file because the log is written in place and never
+// truncated.  Recovery stops at the first one.
+pub fn frame_is_current(f: WalFrame, h: WalHeader) -> Bool
+    todo("pager-nv.pagefmt.frame_is_current")
+
+// The byte offset of frame `n`, zero-based, in a WAL of this page
+// size.
+pub fn frame_offset(page_size: Int, n: Int) -> Int
+    todo("pager-nv.pagefmt.frame_offset")
+
+// Why a run of bytes is not the header or frame it claimed to be.
+pub enum FormatError
+    // The magic is not this format's.  `got` is the four bytes read.
+    BadMagic(got: [Int])
+    // The version is one this build does not read.
+    BadVersion(got: Int, supported: Int)
+    // The buffer is shorter than the structure it was asked for.
+    TooShort(want: Int, have: Int)
+    // A checksum did not match.  The page id is the frame's, or 0 for
+    // a header.
+    BadChecksum(page_id: Int)
+    // The page size is not a power of two in 512..=65536.
+    BadPageSize(got: Int)
+    // The WAL's page size and the database's disagree, which means the
+    // two files are not a pair.
+    PageSizeMismatch(db: Int, wal: Int)
+
+// The human sentence behind each way a header or frame can be wrong.
+impl Error for FormatError
+    fn message(self) -> Str
+        todo("pager-nv.pagefmt.FormatError.message")

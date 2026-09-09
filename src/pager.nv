@@ -1,0 +1,299 @@
+// pager.nv — the file, the log, and one page at a time.
+//
+// This is the half that touches the machine, and every function that
+// does says so in its row.  A caller reading the signatures below
+// knows exactly which calls can fail because of a disk and which
+// cannot, which is what the `host` layer is for.
+//
+// THE READ PATH
+//
+// `read_page` answers from, in order: the frame index of the current
+// write transaction, the WAL's index of committed frames, then the
+// database file.  That order IS the isolation: a reader that started
+// before a commit keeps reading the database file for pages the commit
+// replaced, because its snapshot names a frame count and the index is
+// consulted only up to it.
+//
+// THE WRITE PATH
+//
+// `write_page` appends a frame to the WAL and records it in the write
+// transaction's index.  Nothing touches the database file until
+// `checkpoint`.  `commit` writes the last frame with a non-zero
+// `db_size_after`, which IS the commit record, and fsyncs.
+//
+// WHY THERE IS A WAL AT ALL, GIVEN WHAT THIS WAS DERIVED FROM
+//
+// novodb has no write-ahead log.  `pagefile.page_log_save` builds a
+// fresh in-memory image and serialises the whole thing; its v2 format
+// appends a NEW image at the end of the file and moves an offset in an
+// outer header, and recovery scans the file for valid image offsets
+// and takes the last one before a limit.  That is crash-safe and it
+// rewrites every page on every commit — novodb's own comment on the
+// read side says the same file costs 47 GB of resident memory to open
+// at 5.9 GB on disk.  So the WAL here is designed against SQLite's,
+// which is the reference implementation the must-have plan names, and
+// `paged_file.nv`'s demand-paged reader is what the read path is
+// derived from.
+//
+// WHAT novodb's `lazy_page_store.nv` DID THAT THIS DOES NOT
+//
+// It keeps its cache in a runtime handle table behind `[ffi]` shims,
+// *"so the cache can mutate across calls without the caller threading
+// the store through every `read_page` site"*.  This package threads
+// the pager instead: `read_page` returns a `Pager` along with the
+// page.  That is more typing at every call and it is why `[ffi]`
+// appears nowhere in this package's rows, which is the difference
+// between a library a reader can check and one they cannot.
+
+use std.list
+use btree
+use pagefmt
+
+// An open database.
+//
+// A value, threaded through every call.  Two `Pager`s over one file
+// are two independent readers and the type says so — see the module
+// header for what that costs.
+pub struct Pager
+    path: Str
+    header: pagefmt.DbHeader
+    // The open descriptors.  0 when the file is not open, which is
+    // what `close` leaves behind.
+    db_fd: Int
+    wal_fd: Int
+    // Frames committed to the WAL, newest last.  The read path
+    // searches this backwards before it reads the database file.
+    committed: [FrameRef]
+    // Frames written by the transaction in flight, invisible to any
+    // other reader until `commit`.
+    pending: [FrameRef]
+    // The running checksum after the last frame written.
+    running: pagefmt.Checksum
+    wal: pagefmt.WalHeader
+    // Pages resident in the cache, most recently used last.
+    cache: [CachedPage]
+    cache_limit: Int
+    reads: Int
+    writes: Int
+    hits: Int
+
+// Where one page's newest frame is in the WAL.
+pub struct FrameRef
+    page_id: Int
+    frame: Int
+
+// One page held in memory.
+pub struct CachedPage
+    page_id: Int
+    bytes: [Int]
+
+// A reader's view of the database at one moment.
+//
+// It is a frame count, and that is the whole mechanism: the read path
+// consults the WAL index only up to this number, so a commit that
+// lands afterwards is invisible to this snapshot and needs no lock to
+// stay that way.
+pub struct Snapshot
+    frames: Int
+    change_counter: Int
+
+// Open an existing database, and its WAL if there is one.
+//
+// Recovers first: a WAL whose frames pass their checksums and carry
+// the header's salts is replayed into the index, and the first frame
+// that fails either test ends the scan.  A torn final frame is
+// therefore a frame that was never committed, and dropping it is the
+// whole of crash recovery.
+pub fn open(path: Str) -> Result<Pager, PagerError> [fs]
+    todo("pager-nv.pager.open")
+
+// Create a database at this path, failing if something is already
+// there.
+pub fn create(path: Str, page_size: Int) -> Result<Pager, PagerError> [fs]
+    todo("pager-nv.pager.create")
+
+// Close both files.
+//
+// Does NOT checkpoint: a WAL left behind is read on the next open, and
+// checkpointing at close would turn a crash during close into a
+// half-checkpointed file for no benefit.
+pub fn close(p: Pager) -> Result<Unit, PagerError> [fs]
+    todo("pager-nv.pager.close")
+
+// The page under this id, as `page_size()` bytes.
+//
+// Returns the pager as well, because the cache and the read counter
+// moved.  See the module header for why that is threaded rather than
+// hidden behind a handle.
+pub fn read_page(p: Pager, page_id: Int) -> Result<PageRead, PagerError> [fs]
+    todo("pager-nv.pager.read_page")
+
+// A page, and the pager whose cache now holds it.
+pub struct PageRead
+    pager: Pager
+    bytes: [Int]
+
+// The page under this id as of a snapshot.
+//
+// The WAL index is consulted only up to `snap.frames`, which is what
+// makes a long-running read see a consistent database while writes
+// continue.
+pub fn read_page_at(p: Pager, snap: Snapshot, page_id: Int) -> Result<PageRead, PagerError> [fs]
+    todo("pager-nv.pager.read_page_at")
+
+// Append this page to the WAL as an uncommitted frame.
+//
+// Nothing is visible to another reader until `commit`, and nothing
+// touches the database file until `checkpoint`.
+pub fn write_page(p: Pager, page_id: Int, bytes: [Int]) -> Result<Pager, PagerError> [fs]
+    todo("pager-nv.pager.write_page")
+
+// Allocate a page: reuse the free list's head, or grow the file.
+//
+// Answers the id and the pager that now knows about it.  This is what
+// a `btree.PrAllocPage` is answered with.
+pub fn alloc_page(p: Pager, kind: Int) -> Result<PageAlloc, PagerError> [fs]
+    todo("pager-nv.pager.alloc_page")
+
+// A newly allocated page id, and the pager that allocated it.
+pub struct PageAlloc
+    pager: Pager
+    page_id: Int
+
+// Put a page on the free list.
+//
+// Deferred while any snapshot is outstanding: a freed page whose id is
+// handed straight back to `alloc_page` would be overwritten under a
+// reader still holding it.  novodb has the same deferral and the same
+// reason, in `page.page_free_deferred`.
+pub fn free_page(p: Pager, page_id: Int) -> Result<Pager, PagerError> [fs]
+    todo("pager-nv.pager.free_page")
+
+// Take a snapshot of the database as it is now.
+pub fn snapshot(p: Pager) -> Snapshot
+    todo("pager-nv.pager.snapshot")
+
+// Release a snapshot, letting any deferred frees complete.
+pub fn release(p: Pager, snap: Snapshot) -> Pager
+    todo("pager-nv.pager.release")
+
+// Begin a write transaction.
+//
+// Fails when one is already open on this pager: a nested BEGIN is a
+// caller bug and silently joining the outer transaction is how a
+// rollback loses somebody else's work.
+pub fn begin(p: Pager) -> Result<Pager, PagerError> [fs]
+    todo("pager-nv.pager.begin")
+
+// Commit: write the last frame with the new database size, and fsync.
+//
+// The non-zero `db_size_after` on that frame IS the commit record —
+// there is no separate one, which is what makes a commit one write.
+pub fn commit(p: Pager) -> Result<Pager, PagerError> [fs]
+    todo("pager-nv.pager.commit")
+
+// Discard everything the open transaction wrote.
+//
+// Costs nothing on disk: the frames stay in the WAL and the index that
+// pointed at them is dropped, so the next commit's checksum chain
+// simply does not include them.
+pub fn rollback(p: Pager) -> Result<Pager, PagerError> [fs]
+    todo("pager-nv.pager.rollback")
+
+// Copy every committed frame into the database file, fsync, and reset
+// the log.
+//
+// Blocks until no snapshot is outstanding, because a checkpoint
+// rewrites pages a reader may still be reading from the database file.
+// The salts change, which is what makes every frame already in the
+// file stale without truncating it.
+pub fn checkpoint(p: Pager) -> Result<Checkpointed, PagerError> [fs]
+    todo("pager-nv.pager.checkpoint")
+
+// What a checkpoint moved.
+pub struct Checkpointed
+    pager: Pager
+    pages_written: Int
+    frames_reclaimed: Int
+
+// The database header as it stands.
+pub fn header(p: Pager) -> pagefmt.DbHeader
+    todo("pager-nv.pager.header")
+
+// The page size this file uses.
+pub fn page_size(p: Pager) -> Int
+    todo("pager-nv.pager.page_size")
+
+// How many pages the database holds.
+pub fn page_count(p: Pager) -> Int
+    todo("pager-nv.pager.page_count")
+
+// Reads, writes and cache hits since `open`.
+//
+// Public because a query whose plan is right and whose page traffic is
+// wrong is the common performance bug, and a caller cannot see it
+// without these.
+pub fn stats(p: Pager) -> PagerStats
+    todo("pager-nv.pager.stats")
+
+// The counters `stats` answers.
+pub struct PagerStats
+    reads: Int
+    writes: Int
+    cache_hits: Int
+    wal_frames: Int
+    cached_pages: Int
+
+// Set how many pages the cache holds, evicting down to it.
+pub fn set_cache_limit(p: Pager, pages: Int) -> Pager
+    todo("pager-nv.pager.set_cache_limit")
+
+// A frozen reading of the clock, for sql-engine-nv's `DATE('now')`
+// substitution.
+//
+// THIS FUNCTION IS WHY `[time]` IS IN THIS PACKAGE'S ROWS.  novodb
+// reads the clock inside its executor and discharges the effect to
+// keep the executor pure; a `core` package may not, so the read moved
+// to the only layer allowed to do it and the engine takes the strings
+// as an argument.  One `[time]` function here replaces a discharge
+// there, and the row is the disclosure.
+pub fn now_snapshot() -> NowStrings [time]
+    todo("pager-nv.pager.now_snapshot")
+
+// The three strings the substitution needs.
+//
+// Mirrors sql-engine-nv's `NowSnapshot` field for field rather than
+// re-exporting it, so that a caller who wants the clock without the
+// engine — a log line, a default value — does not take a dependency
+// on the SQL layer to get it.
+pub struct NowStrings
+    date: Str
+    time_of_day: Str
+    datetime: Str
+
+// Why the pager could not do what was asked.
+pub enum PagerError
+    // There is no file at this path.
+    NotFound(path: Str)
+    // Something is already at this path and `create` will not replace
+    // it.
+    Exists(path: Str)
+    // The file's bytes are not this format.
+    BadFormat(cause: pagefmt.FormatError)
+    // A read returned fewer bytes than a page.
+    ShortRead(page_id: Int, got: Int, want: Int)
+    // The operating system refused a read or a write.
+    IoFailed(operation: Str, detail: Str)
+    // This page id is past the end of the database.
+    NoSuchPage(page_id: Int, page_count: Int)
+    // The file was opened for reading only.
+    ReadOnly(path: Str)
+    // A write outside a transaction, or a nested `begin`.
+    NoTransaction(detail: Str)
+    // A checkpoint was asked for while a snapshot was outstanding.
+    SnapshotHeld(count: Int)
+
+// The human sentence behind each way the pager can fail.
+impl Error for PagerError
+    fn message(self) -> Str
+        todo("pager-nv.pager.PagerError.message")

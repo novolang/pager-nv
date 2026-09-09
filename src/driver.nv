@@ -1,0 +1,185 @@
+// driver.nv — the loop that answers, written once.
+//
+// Two `core` packages ask for pages and one `host` package has them.
+// This module is the join: the loop a consumer would otherwise write
+// for itself, with the `[fs]` where the reads are.
+//
+//     execute(pager, sql, params) -> Executed [fs]
+//
+// That is the whole of it from an application's side.  Everything
+// underneath — `sqlengine.step`, `SrPage`, `pager.read_page`,
+// `sqlengine.feed_page`, step again — is what this function does so
+// that nobody else has to.
+//
+// A caller who needs to interleave, batch or stop early does NOT use
+// this: `step_once` is the same body without the loop, and
+// `sqlengine.step` under that is the protocol itself.  Publishing all
+// three is deliberate — a driver that is the only way in is a driver
+// that decides scheduling for its callers.
+//
+// THE `PageIo` IMPL, AND WHY IT IS NOT HERE
+//
+// btree-nv publishes `trait PageIo[e]` and
+// `pub fn run<S: PageIo[e]>(…) [e]`, which is SPEC § 5.6's shape and
+// exactly what this package would supply: `impl PageIo[fs] for Pager`,
+// and a `core` walk charged `[fs]` because THIS impl costs `[fs]`.
+// The impl is not here, and the reason is a compiler defect rather
+// than a design one: a generic function specialised across a module
+// boundary loses the bound it declared, and the clone is then checked
+// with `e` read as a typo'd effect label.  It is filed against
+// novo-lang as
+// *cross-module-specialisation-of-an-effect-polymorphic-function-drops-its-bound*.
+//
+// So the driver below is written against the REQUEST ENUM, which is
+// btree-nv's other published shape and which has no such problem.
+// When the defect is fixed, the impl is four one-line methods and this
+// file gains them; nothing in the signatures below has to change,
+// which is the argument for having published both shapes.
+
+use btree
+use cell
+use sqlast
+use sqlengine
+use pager
+
+// Run one statement to completion and collect its rows.
+//
+// The `[fs]` is this package's, from the reads it performs; the engine
+// contributed none of it.
+//
+// ```novo
+// use pager
+// use driver
+//
+// fn main() [fs, io]
+//     match pager.open("app.db")
+//         Err(e) => println(e.message())
+//         Ok(p)  =>
+//             match driver.execute(p, "SELECT name FROM users", [])
+//                 Ok(out) => println(string_of_int(out.rows_affected))
+//                 Err(e)  => println(e.message())
+// ```
+pub fn execute(p: pager.Pager, sql: Str, params: [cell.Cell]) -> Result<Executed, DriveError> [fs]
+    todo("pager-nv.driver.execute")
+
+// Everything a finished statement produced.
+//
+// The pager comes back because reading moved its cache and writing
+// moved its log; the schema comes back because a DDL statement changed
+// it and the caller has to persist that.
+pub struct Executed
+    pager: pager.Pager
+    schema: sqlengine.Schema
+    columns: [Str]
+    rows: [[cell.Cell]]
+    rows_affected: Int
+
+// Run a statement until its next row, so a caller can stop early.
+//
+// `None` means the statement finished without another row.  A `LIMIT`
+// the caller applies itself, an interactive result the user is paging
+// through, and a cancel button are the three reasons this exists
+// beside `execute`.
+pub fn next_row(p: pager.Pager, e: sqlengine.Engine,
+                st: sqlengine.Statement) -> Result<?RowStep, DriveError> [fs]
+    todo("pager-nv.driver.next_row")
+
+// One row and everything needed to ask for the next.
+//
+// Named `RowStep` and not `NextRow` because struct identity is keyed
+// by NAME across a whole build, dependencies included, and btree-nv
+// already publishes a `NextRow` with different fields (E2004).
+pub struct RowStep
+    pager: pager.Pager
+    engine: sqlengine.Engine
+    statement: sqlengine.Statement
+    row: [cell.Cell]
+
+// Answer whatever the engine last asked for, and step it once.
+//
+// The primitive both functions above are built from, published so that
+// a caller with its own scheduler can drive the engine without
+// reimplementing the answering.
+pub fn step_once(p: pager.Pager, e: sqlengine.Engine,
+                 st: sqlengine.Statement) -> Result<Stepped, DriveError> [fs]
+    todo("pager-nv.driver.step_once")
+
+// One step: what came out, and everything that moved.
+pub struct Stepped
+    pager: pager.Pager
+    engine: sqlengine.Engine
+    statement: sqlengine.Statement
+    result: sqlengine.StepResult
+
+// Perform one page request against the pager.
+//
+// The four-arm `match` that is the entire contract between a `core`
+// package and a `host` one, in one function.  Public because a caller
+// driving a `btree.Cursor` directly — without the SQL layer — needs
+// exactly this and nothing else.
+pub fn answer(p: pager.Pager, request: btree.PageRequest) -> Result<Answered, DriveError> [fs]
+    todo("pager-nv.driver.answer")
+
+// What answering a request produced.
+//
+// `page` is the bytes for a read and empty otherwise; `page_id` is the
+// id an allocation returned and 0 otherwise.  Two fields rather than a
+// second enum because the caller already knows which request it made.
+pub struct Answered
+    pager: pager.Pager
+    page: [Int]
+    page_id: Int
+
+// Read the file's catalog into the schema the engine takes.
+//
+// This is the function that makes `sqlengine.open(schema)` honest: the
+// catalog IS on disk, reading it IS a page walk, and the walk belongs
+// here.  A `core` engine that read its own catalog would have `[fs]`
+// in its public row, and then nothing about the split would be true.
+pub fn load_schema(p: pager.Pager) -> Result<SchemaLoad, DriveError> [fs]
+    todo("pager-nv.driver.load_schema")
+
+// The schema read off the file, and the pager that read it.
+pub struct SchemaLoad
+    pager: pager.Pager
+    schema: sqlengine.Schema
+
+// Write a schema back to the file's catalog pages.
+//
+// Called after a DDL statement, inside the same transaction, so that a
+// crash between the data and the catalog cannot leave a table whose
+// rows exist and whose definition does not.
+pub fn store_schema(p: pager.Pager, s: sqlengine.Schema) -> Result<pager.Pager, DriveError> [fs]
+    todo("pager-nv.driver.store_schema")
+
+// Run a whole script: several statements, one transaction.
+//
+// The entry a migration and a `.sql` dump both want.  Stops at the
+// first statement that fails and rolls back, because a half-applied
+// migration is worse than none.
+pub fn execute_script(p: pager.Pager, sql: Str) -> Result<Executed, DriveError> [fs]
+    todo("pager-nv.driver.execute_script")
+
+// Why a statement did not finish.
+//
+// Three sources, kept apart on purpose: the engine's, the pager's, and
+// the protocol between them.  A caller showing a user an error picks a
+// different sentence for each — a syntax error is theirs, a disk error
+// is the machine's, and a protocol error is this library's.
+pub enum DriveError
+    // The engine rejected the statement or failed mid-run.
+    Engine(cause: sqlast.SqlError)
+    // The pager could not read or write.
+    Storage(cause: pager.PagerError)
+    // The engine asked for something the driver cannot supply, or
+    // asked twice without being answered.  A bug here, not upstream.
+    Protocol(detail: Str)
+    // The statement made no progress in the step budget.  A guard
+    // against a state machine that loops, which is a bug that would
+    // otherwise hang a process rather than fail it.
+    Stalled(steps: Int)
+
+// The human sentence behind each way a statement can fail to finish.
+impl Error for DriveError
+    fn message(self) -> Str
+        todo("pager-nv.driver.DriveError.message")

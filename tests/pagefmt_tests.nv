@@ -1,0 +1,177 @@
+// pagefmt_tests.nv — the file format, asserted as a format.
+//
+// EVERY TEST HERE FAILS TODAY: pager-nv is published as its interface
+// and every body is `todo()`.  What is written below is what the
+// bodies will be measured against, and the byte offsets in it are the
+// FORMAT — a file written by one version and read by another is the
+// whole reason a format is a format, so the offsets are asserted
+// directly rather than round-tripped through the encoder.
+//
+// NONE OF THESE TESTS TOUCH A FILE.  That is the point of `pagefmt`
+// being arithmetic: the format is checkable without a filesystem, and
+// their effect rows are `[io]` for the printer and nothing else.
+
+use std.test
+use std.list
+use std.str
+use pagefmt
+
+@test
+fn test_the_header_sizes_are_the_documented_sizes() [io]
+    test.assert_eq(pagefmt.db_header_size(), 48)
+    test.assert_eq(pagefmt.wal_header_size(), 32)
+    test.assert_eq(pagefmt.wal_frame_header_size(), 24)
+
+@test
+fn test_the_default_page_size_matches_the_tree_s() [io]
+    // btree-nv's `nodefmt.page_size()` is 4096 and so is this.  A pager
+    // that handed the tree a page of another size would be handing it
+    // bytes it cannot decode, and nothing between the two would notice
+    // until a decode failed.
+    test.assert_eq(pagefmt.default_page_size(), 4096)
+
+@test
+fn test_the_db_header_puts_each_field_where_the_layout_says() [io]
+    let h = pagefmt.new_db_header(4096)
+    let raw = pagefmt.encode_db_header(h)
+    test.assert_eq(list.len(raw), pagefmt.db_header_size())
+    // "NVPG"
+    test.assert_eq(raw[0], 78)
+    test.assert_eq(raw[1], 86)
+    test.assert_eq(raw[2], 80)
+    test.assert_eq(raw[3], 71)
+    // Bytes 8..11 are the page size, big-endian: 4096 is 0x00001000.
+    test.assert_eq(raw[8], 0)
+    test.assert_eq(raw[9], 0)
+    test.assert_eq(raw[10], 16)
+    test.assert_eq(raw[11], 0)
+
+@test
+fn test_a_db_header_round_trips() [io]
+    let h = pagefmt.new_db_header(4096)
+    match pagefmt.decode_db_header(pagefmt.encode_db_header(h))
+        Ok(back) =>
+            test.assert_eq(back.page_size, h.page_size)
+            test.assert_eq(back.version, h.version)
+        Err(e)   => test.fail(e.message())
+
+@test
+fn test_a_file_that_is_not_this_format_says_so_by_its_magic() [io]
+    // The first four bytes are the cheapest possible answer to "is this
+    // even one of ours", and a pager that skipped the check would read
+    // a JPEG as a page count.
+    match pagefmt.decode_db_header([0, 0, 0, 0])
+        Ok(h)  => test.fail("four zero bytes are not a header")
+        Err(e) =>
+            match e
+                BadMagic(got)  => test.assert_eq(list.len(got), 4)
+                TooShort(w, v) => test.assert_true(w > v, "or it is simply too short")
+                _              => test.fail("magic or length, not something else")
+
+@test
+fn test_a_page_size_must_be_a_power_of_two_in_range() [io]
+    // 512..=65536, which is SQLite's range and which every offset
+    // calculation in this package assumes.
+    match pagefmt.decode_db_header(pagefmt.encode_db_header(pagefmt.new_db_header(1000)))
+        Ok(h)  => test.fail("1000 is not a power of two")
+        Err(e) =>
+            match e
+                BadPageSize(got) => test.assert_eq(got, 1000)
+                _                => test.fail("the arm names the size")
+
+@test
+fn test_the_wal_header_is_self_checksumming() [io]
+    // `encode_wal_header` computes the two checksums over the first 24
+    // bytes and writes them into the last 8, so what it produces is
+    // always something `decode_wal_header` accepts.
+    let h = WalHeader { version: 1, page_size: 4096, checkpoint_seq: 0,
+                        salt1: 111, salt2: 222, checksum1: 0, checksum2: 0 }
+    match pagefmt.decode_wal_header(pagefmt.encode_wal_header(h))
+        Ok(back) => test.assert_eq(back.salt1, 111)
+        Err(e)   => test.fail(e.message())
+
+@test
+fn test_a_corrupted_wal_header_is_refused() [io]
+    let h = WalHeader { version: 1, page_size: 4096, checkpoint_seq: 0,
+                        salt1: 111, salt2: 222, checksum1: 0, checksum2: 0 }
+    // Flip one byte of the salt the checksum covers.  `list.take` and
+    // `list.skip` are the surface the stdlib has for this; there is no
+    // in-place set, and a `core`-shaped list does not want one.
+    let raw = pagefmt.encode_wal_header(h)
+    let corrupted = list.concat(list.concat(list.take(raw, 16), [0]), list.skip(raw, 17))
+    match pagefmt.decode_wal_header(corrupted)
+        Ok(back) => test.fail("a flipped salt must not pass the checksum")
+        Err(e)   =>
+            match e
+                BadChecksum(pid) => test.assert_eq(pid, 0)
+                _                => test.fail("the checksum is what caught it")
+
+@test
+fn test_the_checksum_is_cumulative_and_that_is_the_whole_point() [io]
+    // A checksum over one frame alone would not notice a frame lifted
+    // out of another log and dropped into this one.  This one carries
+    // the running total, so the same bytes fold to a different value
+    // depending on what came before — which is what makes an inserted
+    // frame detectable.
+    let h = WalHeader { version: 1, page_size: 4096, checkpoint_seq: 0,
+                        salt1: 1, salt2: 2, checksum1: 0, checksum2: 0 }
+    let seed = pagefmt.checksum_seed(h)
+    let once = pagefmt.checksum(seed, [1, 2, 3, 4])
+    let twice = pagefmt.checksum(once, [1, 2, 3, 4])
+    test.assert_true(once.s1 != twice.s1 or once.s2 != twice.s2,
+                     "the same bytes fold differently after a different history")
+
+@test
+fn test_a_frame_round_trips_against_its_running_checksum() [io]
+    let h = WalHeader { version: 1, page_size: 4096, checkpoint_seq: 0,
+                        salt1: 1, salt2: 2, checksum1: 0, checksum2: 0 }
+    let seed = pagefmt.checksum_seed(h)
+    let f = WalFrame { page_id: 7, db_size_after: 0, salt1: 1, salt2: 2,
+                       checksum1: 0, checksum2: 0 }
+    // A page of zeros.  `list.range` is what the stdlib has; there is
+    // no `list.repeat`, and the map is the shortest honest way to it.
+    let page = list.map(list.range(0, 4096), i => 0)
+    match pagefmt.decode_wal_frame(pagefmt.encode_wal_frame(f, page, seed), page, seed)
+        Ok(back) => test.assert_eq(back.page_id, 7)
+        Err(e)   => test.fail(e.message())
+
+@test
+fn test_a_frame_from_before_the_checkpoint_is_not_current() [io]
+    // THE SALTS ARE THE WAL'S DESIGN.  A checkpoint changes them rather
+    // than truncating the log, so a stale frame is one whose salts do
+    // not match — and that is what makes a checkpoint O(1) at the end
+    // and recovery a forward scan that stops by itself.
+    let h = WalHeader { version: 1, page_size: 4096, checkpoint_seq: 5,
+                        salt1: 100, salt2: 200, checksum1: 0, checksum2: 0 }
+    let current = WalFrame { page_id: 1, db_size_after: 0, salt1: 100, salt2: 200,
+                             checksum1: 0, checksum2: 0 }
+    let stale = WalFrame { page_id: 1, db_size_after: 0, salt1: 99, salt2: 200,
+                           checksum1: 0, checksum2: 0 }
+    test.assert_true(pagefmt.frame_is_current(current, h), "the salts match")
+    test.assert_false(pagefmt.frame_is_current(stale, h), "a pre-checkpoint frame does not")
+
+@test
+fn test_a_non_zero_db_size_after_is_the_commit_record() [io]
+    // There is no separate commit record: the last frame of a
+    // transaction carries the new database size and that IS the commit,
+    // which is what makes a commit one write instead of two.
+    let commit = WalFrame { page_id: 3, db_size_after: 12, salt1: 1, salt2: 2,
+                            checksum1: 0, checksum2: 0 }
+    let mid = WalFrame { page_id: 3, db_size_after: 0, salt1: 1, salt2: 2,
+                         checksum1: 0, checksum2: 0 }
+    test.assert_true(commit.db_size_after > 0, "the last frame names the new size")
+    test.assert_eq(mid.db_size_after, 0)
+
+@test
+fn test_frame_offsets_step_by_a_header_plus_a_page() [io]
+    test.assert_eq(pagefmt.frame_offset(4096, 0), pagefmt.wal_header_size())
+    test.assert_eq(pagefmt.frame_offset(4096, 1),
+                   pagefmt.wal_header_size() + pagefmt.wal_frame_header_size() + 4096)
+
+@test
+fn test_a_wal_whose_page_size_differs_from_the_database_s_is_not_its_pair() [io]
+    // Two files that were never a pair look exactly like one file that
+    // was, right up until a page decodes as garbage.  The sizes are the
+    // check that costs nothing.
+    test.assert_true(str.len(PageSizeMismatch(4096, 8192).message()) > 0,
+                     "the error names both sizes")

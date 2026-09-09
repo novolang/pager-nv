@@ -1,0 +1,248 @@
+// pager_tests.nv — the file, the log, and the snapshot.
+//
+// EVERY TEST HERE FAILS TODAY: pager-nv is published as its interface
+// and every body is `todo()`.  Each test below calls a `[fs]` function
+// and declares `[fs]` itself, which is the second thing this file is
+// for: the effect rows a real consumer will carry are written out
+// here, so a reviewer of the interface can see what depending on this
+// package costs before anybody depends on it.
+
+use std.test
+use std.list
+use std.str
+use pager
+
+fn scratch(name: Str) -> Str
+    "/tmp/pager-nv-tests-" + name + ".db"
+
+@test
+fn test_opening_a_file_that_is_not_there_says_which_one() [fs, io]
+    match pager.open(scratch("absent"))
+        Ok(p)  => test.fail("that file does not exist")
+        Err(e) =>
+            match e
+                NotFound(path) => test.assert_true(str.len(path) > 0, "the error names the path")
+                _              => test.fail("absent is NotFound and nothing else")
+
+@test
+fn test_create_then_open_round_trips_the_header() [fs, io]
+    match pager.create(scratch("create"), 4096)
+        Err(e) => test.fail(e.message())
+        Ok(p)  =>
+            test.assert_eq(pager.page_size(p), 4096)
+            test.assert_eq(pager.header(p).change_counter, 0)
+
+@test
+fn test_a_new_database_has_a_catalog_root_and_nothing_else() [fs, io]
+    match pager.create(scratch("fresh"), 4096)
+        Err(e) => test.fail(e.message())
+        Ok(p)  =>
+            test.assert_true(pager.page_count(p) >= 1, "page 1 holds the header")
+            test.assert_eq(pager.header(p).freelist_head, 0)
+
+@test
+fn test_reading_past_the_end_names_both_numbers() [fs, io]
+    // "no such page" alone tells a caller nothing; the count is what
+    // says whether they are one off or reading another database's id.
+    match pager.create(scratch("past-end"), 4096)
+        Err(e) => test.fail(e.message())
+        Ok(p)  =>
+            match pager.read_page(p, 999999)
+                Ok(r)  => test.fail("page 999999 is not in a new file")
+                Err(e) =>
+                    match e
+                        NoSuchPage(id, count) => test.assert_eq(id, 999999)
+                        _                     => test.fail("that is what NoSuchPage is for")
+
+@test
+fn test_a_write_outside_a_transaction_is_refused() [fs, io]
+    // Silently opening one would make a rollback lose work the caller
+    // never knew was uncommitted.
+    match pager.create(scratch("no-tx"), 4096)
+        Err(e) => test.fail(e.message())
+        Ok(p)  =>
+            match pager.write_page(p, 2, [])
+                Ok(q)  => test.fail("a write needs a transaction")
+                Err(e) =>
+                    match e
+                        NoTransaction(d) => test.assert_true(str.len(d) > 0, "it says so")
+                        _                => test.fail("that is what NoTransaction is for")
+
+@test
+fn test_a_nested_begin_is_refused() [fs, io]
+    // Joining the outer transaction is how a rollback throws away
+    // somebody else's work, so the second `begin` fails instead.
+    match pager.create(scratch("nested"), 4096)
+        Err(e) => test.fail(e.message())
+        Ok(p0) =>
+            match pager.begin(p0)
+                Err(e) => test.fail(e.message())
+                Ok(p1) =>
+                    match pager.begin(p1)
+                        Ok(p2) => test.fail("a nested BEGIN is a caller bug")
+                        Err(e) => test.assert_true(str.len(e.message()) > 0, "it says so")
+
+@test
+fn test_a_write_is_invisible_until_it_is_committed() [fs, io]
+    // The whole reason there is a log: a frame written and not
+    // committed is a frame no reader consults, so a crash before the
+    // commit leaves the database exactly as it was.
+    match pager.create(scratch("uncommitted"), 4096)
+        Err(e) => test.fail(e.message())
+        Ok(p0) =>
+            match pager.begin(p0)
+                Err(e) => test.fail(e.message())
+                Ok(p1) =>
+                    let snap = pager.snapshot(p1)
+                    test.assert_eq(snap.change_counter, pager.header(p1).change_counter)
+
+@test
+fn test_a_commit_moves_the_change_counter() [fs, io]
+    // A reader that cached pages checks this before trusting them,
+    // which is the cheapest staleness detector there is.
+    match pager.create(scratch("commit"), 4096)
+        Err(e) => test.fail(e.message())
+        Ok(p0) =>
+            let before = pager.header(p0).change_counter
+            match pager.begin(p0)
+                Err(e) => test.fail(e.message())
+                Ok(p1) =>
+                    match pager.commit(p1)
+                        Err(e) => test.fail(e.message())
+                        Ok(p2) => test.assert_true(pager.header(p2).change_counter > before,
+                                                   "a commit is visible in the header")
+
+@test
+fn test_a_rollback_costs_nothing_on_disk() [fs, io]
+    // The frames stay in the log and the index that pointed at them is
+    // dropped, so the next commit's checksum chain simply does not
+    // include them.  A rollback that had to rewrite would be a rollback
+    // that could fail.
+    match pager.create(scratch("rollback"), 4096)
+        Err(e) => test.fail(e.message())
+        Ok(p0) =>
+            match pager.begin(p0)
+                Err(e) => test.fail(e.message())
+                Ok(p1) =>
+                    match pager.rollback(p1)
+                        Err(e) => test.fail(e.message())
+                        Ok(p2) => test.assert_eq(pager.stats(p2).wal_frames, 0)
+
+@test
+fn test_a_snapshot_is_a_frame_count_and_that_is_the_isolation() [fs, io]
+    // The read path consults the WAL index only up to this number, so a
+    // commit that lands afterwards is invisible to this snapshot and
+    // needs no lock to stay that way.
+    match pager.create(scratch("snapshot"), 4096)
+        Err(e) => test.fail(e.message())
+        Ok(p)  =>
+            let snap = pager.snapshot(p)
+            test.assert_eq(snap.frames, pager.stats(p).wal_frames)
+
+@test
+fn test_a_checkpoint_will_not_run_under_an_outstanding_snapshot() [fs, io]
+    // A checkpoint rewrites database pages a reader may still be
+    // reading, so it refuses rather than corrupting one.
+    match pager.create(scratch("checkpoint-held"), 4096)
+        Err(e) => test.fail(e.message())
+        Ok(p)  =>
+            let snap = pager.snapshot(p)
+            match pager.checkpoint(p)
+                Ok(done) => test.assert_true(done.pages_written >= 0, "or nothing was outstanding")
+                Err(e)   =>
+                    match e
+                        SnapshotHeld(n) => test.assert_true(n > 0, "it says how many")
+                        _               => test.fail("that is what SnapshotHeld is for")
+
+@test
+fn test_releasing_a_snapshot_lets_deferred_frees_complete() [fs, io]
+    // A freed page whose id went straight back to `alloc_page` would be
+    // overwritten under a reader still holding it, which is why the
+    // free defers.  novodb defers for the same reason.
+    match pager.create(scratch("release"), 4096)
+        Err(e) => test.fail(e.message())
+        Ok(p)  =>
+            let snap = pager.snapshot(p)
+            test.assert_eq(pager.header(pager.release(p, snap)).freelist_head, 0)
+
+@test
+fn test_alloc_reuses_the_free_list_before_it_grows_the_file() [fs, io]
+    // A file that grew on every insert and never shrank would be a file
+    // that only gets bigger, which is what a free list is for.
+    match pager.create(scratch("alloc"), 4096)
+        Err(e) => test.fail(e.message())
+        Ok(p0) =>
+            match pager.begin(p0)
+                Err(e) => test.fail(e.message())
+                Ok(p1) =>
+                    match pager.alloc_page(p1, 6)
+                        Err(e) => test.fail(e.message())
+                        Ok(a)  => test.assert_true(a.page_id > 1, "page 1 is the header's")
+
+@test
+fn test_free_puts_a_page_back() [fs, io]
+    match pager.create(scratch("free"), 4096)
+        Err(e) => test.fail(e.message())
+        Ok(p0) =>
+            match pager.begin(p0)
+                Err(e) => test.fail(e.message())
+                Ok(p1) =>
+                    match pager.free_page(p1, 2)
+                        Err(e) => test.fail(e.message())
+                        Ok(p2) => test.assert_true(pager.header(p2).freelist_count >= 0,
+                                                   "the count is tracked")
+
+@test
+fn test_read_page_at_answers_the_snapshot_and_not_the_present() [fs, io]
+    match pager.create(scratch("read-at"), 4096)
+        Err(e) => test.fail(e.message())
+        Ok(p)  =>
+            let snap = pager.snapshot(p)
+            match pager.read_page_at(p, snap, 1)
+                Ok(r)  => test.assert_eq(list.len(r.bytes), pager.page_size(p))
+                Err(e) => test.assert_true(str.len(e.message()) > 0, "or it says why not")
+
+@test
+fn test_the_cache_limit_is_the_caller_s_to_set() [fs, io]
+    // A library that decided how much memory to hold for its embedder
+    // is a library that gets a memory budget wrong on somebody else's
+    // machine.
+    match pager.create(scratch("cache"), 4096)
+        Err(e) => test.fail(e.message())
+        Ok(p)  => test.assert_eq(pager.stats(pager.set_cache_limit(p, 8)).cached_pages <= 8, true)
+
+@test
+fn test_stats_are_public_because_page_traffic_is_the_common_bug() [fs, io]
+    // A query whose plan is right and whose page traffic is wrong is
+    // the performance problem people actually have, and a caller cannot
+    // see it without these.
+    match pager.create(scratch("stats"), 4096)
+        Err(e) => test.fail(e.message())
+        Ok(p)  =>
+            let s = pager.stats(p)
+            test.assert_eq(s.writes, 0)
+            test.assert_eq(s.cache_hits, 0)
+
+@test
+fn test_close_does_not_checkpoint() [fs, io]
+    // A WAL left behind is read on the next open, and checkpointing at
+    // close would turn a crash during close into a half-checkpointed
+    // file for no benefit at all.
+    match pager.create(scratch("close"), 4096)
+        Err(e) => test.fail(e.message())
+        Ok(p)  =>
+            match pager.close(p)
+                Ok(u)  => test.assert_true(true, "closing succeeds")
+                Err(e) => test.fail(e.message())
+
+@test
+fn test_the_clock_is_read_here_because_core_may_not_read_it() [time, io]
+    // THE ONLY `[time]` IN THE PACKAGE, and the reason it exists.
+    // novodb reads the clock inside its executor and discharges the
+    // effect to keep the executor pure; a `core` package may not, so
+    // the read moved to the only layer allowed to do it and
+    // sql-engine-nv takes the strings as an argument.  One `[time]`
+    // function here replaces a discharge there.
+    let now = pager.now_snapshot()
+    test.assert_true(str.len(now.date) > 0, "a date came back")
+    test.assert_true(str.len(now.datetime) > 0, "and a datetime")

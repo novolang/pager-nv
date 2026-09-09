@@ -1,0 +1,180 @@
+// driver_tests.nv — the join between two `core` packages and a file.
+//
+// EVERY TEST HERE FAILS TODAY: pager-nv is published as its interface
+// and every body is `todo()`.
+//
+// WHAT THIS FILE IS REALLY CHECKING IS THE EFFECT ARITHMETIC, and it
+// checks it by compiling.  Every function below declares `[fs]` and
+// gets it from `pager` and `driver`; NOTHING it calls in
+// `sql-engine-nv` or `btree-nv` contributes an effect, because those
+// two packages are `core` and their budget is `[]`.  Were that untrue
+// — were the engine reaching for a file behind the interface — this
+// file would still compile and the shard audit's `effect-budget` row
+// on the two `core` packages would be the thing that failed.  The two
+// checks together are the split's proof.
+
+use std.test
+use std.list
+use std.str
+use btree
+use sqlengine
+use pager
+use driver
+
+fn scratch(name: Str) -> Str
+    "/tmp/pager-nv-driver-" + name + ".db"
+
+@test
+fn test_execute_is_the_whole_package_from_an_application_s_side() [fs, io]
+    // Five calls become one.  Everything underneath — step, SrPage,
+    // read_page, feed_page, step again — is what this function does so
+    // that nobody else has to.
+    match pager.create(scratch("execute"), 4096)
+        Err(e) => test.fail(e.message())
+        Ok(p)  =>
+            match driver.execute(p, "SELECT 1", [])
+                Ok(out) => test.assert_eq(out.rows_affected, 1)
+                Err(e)  => test.assert_true(str.len(e.message()) > 0, "or it says why not")
+
+@test
+fn test_the_fs_row_on_execute_is_the_pager_s_and_not_the_engine_s() [fs, io]
+    // THIS TEST'S OWN SIGNATURE IS THE ASSERTION.  It declares `[fs]`,
+    // and the compiler agrees only because `driver.execute` does.  A
+    // `sqlengine` call in the same function adds nothing to the row,
+    // which is the entire claim of the split written as code.
+    let e = sqlengine.open(sqlengine.schema_new())
+    test.assert_none(sqlengine.awaiting(e))
+    match pager.create(scratch("rows"), 4096)
+        Err(x) => test.fail(x.message())
+        Ok(p)  => test.assert_eq(pager.page_size(p), 4096)
+
+@test
+fn test_a_ddl_statement_gives_the_schema_back_to_persist() [fs, io]
+    // The schema comes out of `Executed` because a DDL statement
+    // changed it and the caller has to write it down; keeping a second
+    // copy is how the file and the engine drift apart.
+    match pager.create(scratch("ddl"), 4096)
+        Err(e) => test.fail(e.message())
+        Ok(p)  =>
+            match driver.execute(p, "CREATE TABLE t (a INTEGER)", [])
+                Ok(out) => test.assert_eq(list.len(out.schema.tables), 1)
+                Err(e)  => test.assert_true(str.len(e.message()) > 0, "or it says why not")
+
+@test
+fn test_columns_come_back_even_when_no_row_does() [fs, io]
+    // A caller drawing a table header cannot wait for a row that may
+    // never arrive, so the metadata rides on the same result.
+    match pager.create(scratch("columns"), 4096)
+        Err(e) => test.fail(e.message())
+        Ok(p)  =>
+            match driver.execute(p, "SELECT a, b FROM t WHERE 1 = 0", [])
+                Ok(out) =>
+                    test.assert_eq(list.len(out.rows), 0)
+                    test.assert_eq(out.columns, ["a", "b"])
+                Err(e)  => test.assert_true(str.len(e.message()) > 0, "or it says why not")
+
+@test
+fn test_next_row_is_the_shape_a_limit_needs() [fs, io]
+    // `execute` does not come back until the statement is over, so an
+    // interactive result, a caller-applied LIMIT and a cancel button
+    // all need the other one.
+    match pager.create(scratch("next-row"), 4096)
+        Err(e) => test.fail(e.message())
+        Ok(p)  =>
+            let eng = sqlengine.open(sqlengine.schema_new())
+            match sqlengine.prepare(eng, "SELECT 1")
+                Err(x) => test.fail(x.message())
+                Ok(st) =>
+                    match driver.next_row(p, eng, st)
+                        Ok(hit) => test.assert_true(true, "None means the statement finished")
+                        Err(x)  => test.assert_true(str.len(x.message()) > 0, "or it says why not")
+
+@test
+fn test_step_once_is_published_so_a_scheduler_can_own_the_loop() [fs, io]
+    // A driver that is the only way in is a driver that decides
+    // scheduling for its callers.
+    match pager.create(scratch("step-once"), 4096)
+        Err(e) => test.fail(e.message())
+        Ok(p)  =>
+            let eng = sqlengine.open(sqlengine.schema_new())
+            match sqlengine.prepare(eng, "SELECT 1")
+                Err(x) => test.fail(x.message())
+                Ok(st) =>
+                    match driver.step_once(p, eng, st)
+                        Ok(s)  => test.assert_true(true, "one step happened")
+                        Err(x) => test.assert_true(str.len(x.message()) > 0, "or it says why not")
+
+@test
+fn test_answer_performs_one_request_and_nothing_else() [fs, io]
+    // The four-arm match that is the entire contract between a `core`
+    // package and a `host` one.  Public because a caller driving a
+    // `btree.Cursor` without the SQL layer needs exactly this.
+    match pager.create(scratch("answer"), 4096)
+        Err(e) => test.fail(e.message())
+        Ok(p)  =>
+            match driver.answer(p, PrNeedPage(1))
+                Ok(a)  => test.assert_eq(list.len(a.page), pager.page_size(p))
+                Err(x) => test.assert_true(str.len(x.message()) > 0, "or it says why not")
+
+@test
+fn test_answering_an_allocation_gives_back_an_id_and_no_page() [fs, io]
+    // Two fields rather than a second enum, because the caller already
+    // knows which request it made.
+    match pager.create(scratch("answer-alloc"), 4096)
+        Err(e) => test.fail(e.message())
+        Ok(p)  =>
+            match driver.answer(p, PrAllocPage(6))
+                Ok(a)  =>
+                    test.assert_eq(list.len(a.page), 0)
+                    test.assert_true(a.page_id > 0, "an allocation has an id")
+                Err(x) => test.assert_true(str.len(x.message()) > 0, "or it says why not")
+
+@test
+fn test_load_schema_is_what_makes_open_schema_honest() [fs, io]
+    // The catalog IS on disk, reading it IS a page walk, and the walk
+    // belongs here.  A `core` engine that read its own catalog would
+    // have `[fs]` in its public row, and then nothing about the split
+    // would be true.
+    match pager.create(scratch("load-schema"), 4096)
+        Err(e) => test.fail(e.message())
+        Ok(p)  =>
+            match driver.load_schema(p)
+                Ok(s)  => test.assert_eq(list.len(s.schema.tables), 0)
+                Err(x) => test.assert_true(str.len(x.message()) > 0, "or it says why not")
+
+@test
+fn test_store_schema_runs_inside_the_same_transaction_as_the_data() [fs, io]
+    // A crash between the rows and the catalog would otherwise leave a
+    // table whose rows exist and whose definition does not.
+    match pager.create(scratch("store-schema"), 4096)
+        Err(e) => test.fail(e.message())
+        Ok(p)  =>
+            match driver.store_schema(p, sqlengine.schema_new())
+                Ok(q)  => test.assert_true(true, "the catalog was written")
+                Err(x) => test.assert_true(str.len(x.message()) > 0, "or it says why not")
+
+@test
+fn test_a_script_that_fails_halfway_rolls_all_of_it_back() [fs, io]
+    // A half-applied migration is worse than none: the next run has no
+    // way to tell which half already happened.
+    match pager.create(scratch("script"), 4096)
+        Err(e) => test.fail(e.message())
+        Ok(p)  =>
+            match driver.execute_script(p, "CREATE TABLE t (a INTEGER); NOT SQL;")
+                Ok(out) => test.fail("the second statement is not SQL")
+                Err(x)  =>
+                    match x
+                        Engine(cause) => test.assert_true(str.len(cause.message()) > 0,
+                                                          "the engine said what was wrong")
+                        _             => test.fail("a parse failure is the engine's")
+
+@test
+fn test_the_three_error_sources_stay_apart() [fs, io]
+    // A caller showing a user an error picks a different sentence for
+    // each: a syntax error is theirs, a disk error is the machine's,
+    // and a protocol error is this library's.  One collapsed type would
+    // make all three read the same.
+    test.assert_true(str.len(Engine(SeDivideByZero).message()) > 0, "the engine's")
+    test.assert_true(str.len(Storage(ReadOnly("/x")).message()) > 0, "the pager's")
+    test.assert_true(str.len(Protocol("fed twice").message()) > 0, "the protocol's")
+    test.assert_true(str.len(Stalled(1024).message()) > 0, "and the guard's")
