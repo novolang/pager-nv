@@ -33,4 +33,4 @@ maintainers = ["novo-lang"]
 # is linear and a dependency's layer may not be wider than its
 # consumer's.
 btree-nv = "^0.0.1"
-sql-engine-nv = "^0.0.1"
+sql-engine-nv = "^0.0.2"
