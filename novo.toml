@@ -1,6 +1,6 @@
 [package]
 name        = "pager-nv"
-version     = "0.0.3"
+version     = "0.0.4"
 description = "The page file and its write-ahead log: an on-disk header, WAL frames with SQLite's rolling checksum, read and write of one page at a time, commit and checkpoint — and the driver loop that runs a sql-engine-nv statement to completion by answering everything it asks for."
 license     = "Apache-2.0"
 
@@ -33,5 +33,5 @@ novo        = ">= 0.8.9"
 # Both `core`, so a `host` package may depend on them — the layer order
 # is linear and a dependency's layer may not be wider than its
 # consumer's.
-btree-nv = "^0.0.2"
-sql-engine-nv = "^0.0.3"
+btree-nv = "^0.0.3"
+sql-engine-nv = "^0.0.4"

@@ -37,7 +37,7 @@
 // which is the argument for having published both shapes.
 
 use btree
-use cell
+use btcell
 use sqlast
 use sqlengine
 use pager
@@ -59,7 +59,7 @@ use pager
 //                 Ok(out) => println(string_of_int(out.rows_affected))
 //                 Err(e)  => println(e.message())
 // ```
-pub fn execute(p: pager.Pager, sql: Str, params: [cell.Cell]) -> Result<Executed, DriveError> [fs]
+pub fn execute(p: pager.Pager, sql: Str, params: [btcell.Cell]) -> Result<Executed, DriveError> [fs]
     todo("pager-nv.driver.execute")
 
 // Everything a finished statement produced.
@@ -71,7 +71,7 @@ pub struct Executed
     pager: pager.Pager
     schema: sqlengine.Schema
     columns: [Str]
-    rows: [[cell.Cell]]
+    rows: [[btcell.Cell]]
     rows_affected: Int
 
 // Run a statement until its next row, so a caller can stop early.
@@ -93,7 +93,7 @@ pub struct RowStep
     pager: pager.Pager
     engine: sqlengine.Engine
     statement: sqlengine.Statement
-    row: [cell.Cell]
+    row: [btcell.Cell]
 
 // Answer whatever the engine last asked for, and step it once.
 //
