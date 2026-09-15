@@ -1,145 +1,318 @@
 # pager-nv
 
-**Status: NOT IMPLEMENTED — interface only.**
+A **pager** is the layer of a database that owns the file. It divides
+the file into fixed-size pages, hands one page at a time to the layers
+above it, and makes a set of writes either all appear or none of them.
+A **write-ahead log** is how it does the last part: a change is
+appended to a second file first, and copied back into the database
+file later. SQLite's [write-ahead log](https://www.sqlite.org/wal.html)
+is the design this package follows. It answers the page requests that
+[btree-nv](https://novo-lang.org/packages/btree-nv) and
+[sql-engine-nv](https://novo-lang.org/packages/sql-engine-nv) make, and
+it is the only one of the three that opens a file.
 
-Every public function below is published with its signature and its
-effect row, and every body is `todo()`.  Installing this package
-works; calling it panics with `not implemented`.
+**Status: NOT IMPLEMENTED — interface only.** Every function is
+declared with its full signature, but every body is a `todo()` that
+panics when called. The package is published so its design can be
+reviewed and depended on before it is implemented. Version 0.1.0 will
+be the first working release.
 
-## What this is
+## What it is
 
-The half that touches the file.  A database header, a write-ahead log
-with SQLite's rolling checksum and its salts, one page in and one page
-out, commit and checkpoint — and the loop that runs a `sql-engine-nv`
-statement to completion by answering everything it asks for.
+A database here is two files: the **database file**, which holds the
+pages, and the **write-ahead log**, the WAL, which holds pages that
+have been changed and not yet copied back. A **page** is a fixed-size
+block of bytes, 4096 by default.
 
-Three packages come out of novodb and this is the only one with `[fs]`
-in it.  For an end user that means the effect rows are the map: a
-signature here that does not say `[fs]` cannot reach a disk, and a
-`core` package underneath cannot reach one at all.
+A write does not touch the database file. It appends a **frame** to
+the WAL, and a frame is a 24-byte header and one page of content. A
+**commit** is the last frame of a transaction, and it is marked by
+that frame's header carrying the database's new size in pages. There
+is no separate commit record. A **checkpoint** copies every committed
+frame back into the database file and resets the log.
 
-## The one example that will work
+A read consults, in order, the frames of the write transaction that is
+open, then the WAL's index of committed frames, then the database
+file. That order is the isolation. A **snapshot** is a frame count: a
+reader holding one consults the index only up to it, so it keeps
+seeing the database as it was while writes carry on.
+
+Every frame carries the two **salts** from the WAL's header, and a
+**checkpoint changes the salts** rather than truncating the log. A
+frame whose salts do not match the header's is left over from before
+the last checkpoint. That is what makes a checkpoint cost nothing at
+the end and makes recovery a forward scan that stops by itself.
+
+Every frame also carries a **cumulative checksum**: each frame's
+checksum folds in the frames before it. A frame lifted out of another
+log and dropped into this one is therefore detected, where a
+per-frame checksum would accept it.
+
+**Recovery** happens on `open`. Frames are replayed into the index
+while they pass their checksums and carry the header's salts, and the
+first frame that fails either test ends the scan. A torn final frame
+is a frame that was never committed, and dropping it is the whole of
+crash recovery.
+
+The file formats are this package's own, and they are given here in
+full.
+
+| Structure | Size |
+| --- | --- |
+| Database header, at the front of page 1 | 48 bytes |
+| WAL header, at the front of the log | 32 bytes |
+| WAL frame header, followed by one page | 24 bytes |
+| Default page size | 4096 bytes |
+| Page sizes accepted | a power of two from 512 to 65536 |
+
+**The database header.**
+
+| Bytes | Contents |
+| --- | --- |
+| 0 to 3 | The magic, `NVPG` |
+| 4 to 7 | Format version |
+| 8 to 11 | Page size in bytes |
+| 12 to 15 | Page count |
+| 16 to 19 | The first page of the free list, 0 for none |
+| 20 to 23 | Free-list page count |
+| 24 to 27 | Change counter, incremented at every commit |
+| 28 to 31 | Schema cookie, incremented at every DDL statement |
+| 32 to 35 | The catalog's root page |
+| 36 to 47 | Reserved, zero |
+
+**The WAL header.**
+
+| Bytes | Contents |
+| --- | --- |
+| 0 to 3 | The magic, `NVWL` |
+| 4 to 7 | Format version |
+| 8 to 11 | Page size, which must equal the database's |
+| 12 to 15 | Checkpoint sequence, incremented at every checkpoint |
+| 16 to 19 | Salt 1, changed at every checkpoint |
+| 20 to 23 | Salt 2, random at every checkpoint |
+| 24 to 27 | Checksum 1 over bytes 0 to 23 |
+| 28 to 31 | Checksum 2 over bytes 0 to 23 |
+
+**A WAL frame header.**
+
+| Bytes | Contents |
+| --- | --- |
+| 0 to 3 | The page id this frame holds |
+| 4 to 7 | The database size in pages after this frame, or 0 when the frame is not a commit |
+| 8 to 11 | Salt 1, copied from the WAL header |
+| 12 to 15 | Salt 2, copied from the WAL header |
+| 16 to 19 | Checksum 1, over the running total and this frame |
+| 20 to 23 | Checksum 2 |
+
+Every number in both formats is big-endian.
+
+Only the functions that reach a file declare `[fs]`, and exactly one
+function declares `[time]`. `pagefmt` declares no effect at all: it is
+arithmetic over byte lists, so the whole format can be tested with no
+disk in the test.
+
+## Install
+
+```
+novo pkg add pager-nv
+```
+
+## Example
 
 ```novo
-use pager
 use driver
+use pager
 
-fn main() [fs, io]
+fn main() [io, fs]
+    // Open the database and replay its write-ahead log. A torn final
+    // frame is one that was never committed, and it is dropped here.
     match pager.open("app.db")
         Err(e) => println(e.message())
         Ok(p)  =>
+            // Run one statement to the end. This call answers every
+            // page the engine asks for, which is where the [fs] is.
             match driver.execute(p, "SELECT name FROM users", [])
-                Ok(out) => println(string_of_int(out.rows_affected))
                 Err(e)  => println(e.message())
+                Ok(out) => println("${out.rows_affected} rows")
 ```
 
-## The layer, and why
+Build and test with `novo pkg build` and `novo test`. Today `novo test`
+fails on purpose: every test reaches a
+`not implemented: pager-nv.<module>.<fn>` panic. The tests are the
+specification the implementation will have to satisfy.
 
-`host`.  Two effects, and both are disclosures rather than
-conveniences.
+## What the package contains
 
-**`[fs]`** is on every function that reaches the file, and only on
-those: `pagefmt` — the header, the frame, the checksum — is pure
-arithmetic over byte lists and declares nothing.  It sits in a `host`
-package because the FORMAT is the pager's, and it is written so that
-moving it to `core` later costs a manifest edit and nothing else.
-`tests/pagefmt_tests.nv` checks the whole format without touching a
-disk, which is what that separation buys.
+| Module | Contents |
+| --- | --- |
+| `pagefmt` | The two headers and the frame header, their encoders and decoders, the rolling checksum, and the salt comparison recovery stops on. It performs nothing. |
+| `pager` | The file and the log: open, create and close, one page in and one page out, allocate and free, snapshot and release, begin, commit, rollback and checkpoint. |
+| `driver` | The loop that answers a SQL statement's page requests to the end, and the three smaller pieces it is built from. |
 
-**`[time]`** is on exactly one function, `now_snapshot`, and it is here
-because it could not be anywhere else.  novodb rewrites `DATE('now')`
-and its family into literals inside its executor, and reaches for
-`time.now()` to do it by DISCHARGING the effect — its own comment says
-the discharge is what keeps the executor effect-free.  A `core`
-package may not: `no-discharge-in-core` is a shard row, and
-discharging an effect is a lie about a budget rather than a way to
-meet one.  So the read moved to the only layer allowed to do it, and
-`sql-engine-nv.substitute_now` takes the three formatted strings as an
-argument.  One `[time]` function here replaces a discharge there.
+## How to choose an entry point
 
-## The load-bearing interface
+**`driver.execute` runs one statement to the end.** It steps the SQL
+engine, reads whatever page the engine asks for, feeds it back, and
+steps again, until there are no more rows. It is the whole of this
+package from an application's side.
 
-```novo
-pub fn answer(p: Pager, request: btree.PageRequest) -> Result<Answered, DriveError> [fs]
-```
+**`driver.next_row` stops at each row.** Use it for a query whose
+answer is larger than memory, or one the caller may abandon.
 
-Four arms — `PrNeedPage`, `PrWritePage`, `PrAllocPage`, `PrFreePage` —
-and that one function is the entire contract between the two `core`
-packages and the machine.  `step_once` puts it beside a
-`sqlengine.step`; `execute` puts `step_once` in a loop; and all three
-are published, because a driver that is the only way in is a driver
-that decides scheduling for its callers.
+**`driver.step_once` is the same body without the loop**, for a caller
+that has to interleave two statements, batch its reads, or put a
+statement away and come back to it.
 
-**btree-nv also publishes a second shape — `trait PageIo[e]` and
-`pub fn run<S: PageIo[e]>(…) [e]` — and this package would supply
-`impl PageIo[fs] for Pager`.**  That is SPEC § 5.6's design working
-exactly as intended: a `core` walk charged `[fs]` because this impl
-costs `[fs]`, and nothing in btree-nv's own budget touched.  The impl
-is not in this release, and the reason is a compiler defect rather
-than a design one — a generic function specialised across a module
-boundary loses the bound it declared, and the clone is then checked
-with `e` read as a typo'd effect label.  It is filed against novo-lang
-as
-*cross-module-specialisation-of-an-effect-polymorphic-function-drops-its-bound*.
-When it is fixed the impl is four one-line methods and nothing in the
-signatures below changes, which is the argument for having published
-both shapes.
+**`driver.answer` performs one page request.** It takes a
+`btree.PageRequest` and does the read, the write, the allocation or
+the free. A caller driving the B-tree itself, with no SQL in the
+program, needs only this and `pager`.
 
-## The reference implementation
+**`pager` on its own is a page store with transactions.** A program
+with its own structure over pages uses `read_page`, `write_page`,
+`alloc_page`, `begin` and `commit`, and never names the SQL layer.
 
-SQLite's pager and WAL as the design, and **novodb's `paged_file.nv`,
-`paged_file_writer.nv`, `lazy_page_store.nv` and `pagefile.nv` as the
-code** — for the read path.  The write path had nothing to port.
+## The rules a user needs
 
-| novodb | here | why |
-| --- | --- | --- |
-| **no write-ahead log.**  `page_log_save` builds a whole in-memory image and serialises it; v2 appends a NEW image and moves an offset in an outer header, and recovery scans the file for valid image offsets | a WAL: frames, salts, a cumulative checksum, and a commit record that is a field on the last frame | novodb's is crash-safe and rewrites every page on every commit; its own read-side comment measures a 5.9 GB file costing ~47 GB of resident memory to open |
-| the demand-paged reader keeps its cache in a runtime handle table behind `[ffi]` shims, so a caller need not thread the store | the pager is a value, threaded — `read_page` returns a `Pager` beside the page | more typing at every call, and `[ffi]` appears in no row in this package; that is the difference between a library a reader can check and one they cannot |
-| `page_free_deferred` defers a free while a snapshot is pinned | `free_page` defers for the same reason | this one came across unchanged, because it is right: a freed id handed back to `alloc_page` would be overwritten under a reader still holding it |
+1. **Every function that can touch a file says `[fs]` in its
+   signature.** A signature here without it cannot reach a disk, and
+   `pagefmt` has none at all.
+2. **The pager is a value and it is threaded.** `read_page` answers
+   the page and a `Pager` beside it, because the cache and the
+   counters moved. Two `Pager` values over one file are two
+   independent readers.
+3. **A write needs a transaction.** `write_page` outside one is
+   refused with `NoTransaction`, and a second `begin` on the same
+   pager is refused the same way. Silently joining the outer
+   transaction is how a rollback loses somebody else's work.
+4. **A commit is one write.** `commit` writes the last frame with the
+   database's new size in its header and then fsyncs. That non-zero
+   size is the commit record.
+5. **A rollback costs nothing on disk.** The frames stay in the log
+   and the index that pointed at them is dropped. The next commit's
+   checksum chain simply does not include them.
+6. **A checkpoint waits for every snapshot to be released.** It
+   rewrites pages a reader may still be reading out of the database
+   file. `SnapshotHeld` is the refusal, carrying how many are
+   outstanding.
+7. **`close` does not checkpoint.** A log left behind is read on the
+   next open. Checkpointing at close would turn a crash during close
+   into a half-checkpointed file for no benefit.
+8. **A free is deferred while any snapshot is outstanding.** A freed
+   page id handed straight back to `alloc_page` would be overwritten
+   under a reader still holding it. `release` is what lets the
+   deferred frees complete.
+9. **Read the change counter before trusting a cached page.** It is
+   incremented at every commit, and comparing it is the cheapest
+   staleness check there is.
+10. **Re-prepare a statement when the schema cookie moves.** It is
+    incremented at every DDL statement, and a plan that outlives its
+    schema is how a query silently reads the wrong column.
+11. **The WAL's page size must equal the database's.** Two files whose
+    headers disagree are not a pair, and `PageSizeMismatch` says so
+    rather than reading one as the other.
+12. **The checksum is cumulative and cannot be computed frame by
+    frame.** `pagefmt.checksum` folds a run of bytes into a running
+    pair, and `pagefmt.checksum_seed` starts it from the header's
+    salts. It is SQLite's rolling pair: `s1 += x + s2` then
+    `s2 += x + s1` over 32-bit big-endian words.
+13. **A frame whose salts do not match the header's is old.**
+    `pagefmt.frame_is_current` is that comparison, and recovery stops
+    at the first frame that fails it.
+14. **`pager.now_snapshot` is the only function here that reads a
+    clock.** It answers the three formatted strings a SQL engine needs
+    to substitute for `DATE('now')` and its family.
+    `sql-engine-nv.substitute_now` takes them as an argument, because
+    a package that declares no effects may not read a clock.
 
-The salts are the part of the WAL design most worth reading before
-adding a body.  A checkpoint changes them rather than truncating the
-log, so a frame whose salts do not match the header's is a frame from
-before the last checkpoint — which is what makes a checkpoint O(1) at
-the end and recovery a forward scan that stops by itself.
+## What is not included
 
-## Building it, and checking it
+- **A `PageIo` implementation.** btree-nv publishes
+  `trait PageIo[e]` and `pageio.run`, and this package would supply
+  `impl PageIo[fs] for Pager`, so that a walk in a package with no
+  effects is charged `[fs]` because this implementation costs `[fs]`.
+  It is not in this release. The driver below is written against the
+  page-request enum instead, which is btree-nv's other published
+  shape.
+- **Concurrency between processes.** There is no file lock here. Two
+  processes writing one database is not something this release
+  defends against.
+- **A background checkpointer.** `checkpoint` is a call the program
+  makes. Deciding when is the program's.
+- **Compression and encryption of pages.** A page is written as it was
+  handed over.
+- **A device build.** Every function that matters takes or returns a
+  `[Int]` of page bytes, and the package's whole purpose is a file.
+
+## Related packages
+
+- [btree-nv](https://novo-lang.org/packages/btree-nv) is the ordered
+  map over these pages. It never reads one: it answers
+  `btree.PageRequest`, and `driver.answer` is what performs those
+  requests.
+- [sql-engine-nv](https://novo-lang.org/packages/sql-engine-nv) is the
+  SQL lexer, parser, planner and executor. It relays the page requests
+  its cursors make, so `driver.execute` drives one loop rather than
+  two.
+- [sqlite-nv](https://novo-lang.org/packages/sqlite-nv) reads and
+  writes a real SQLite database file, in SQLite's own format. Take
+  that package to open a file another program wrote. Take this one for
+  a database in a format of your own.
+- [lsm-nv](https://novo-lang.org/packages/lsm-nv) is the other storage
+  shape, and its log makes the same three decisions as the one here: a
+  generation rather than a truncation, a cumulative checksum, and the
+  commit marker inside the record. It logs entries where this logs
+  pages.
+- `std.fs` in the standard library is where the bytes come from and
+  where they go.
+
+## Tests
 
 ```bash
-novo pkg add pager-nv       # add it to a package
-novo pkg build              # type-check and effect-check every module
-novo test tests/pagefmt_tests.nv
+novo test tests/pagefmt_tests.nv   # 14 tests: the two headers and the frame, by offset
+novo test tests/pager_tests.nv     # 19 tests: the file, the log, and recovery
+novo test tests/driver_tests.nv    # 12 tests: the page-request loop
 ```
 
-**`novo test` is red on every suite, and that is the published state.**
-Each test calls a function whose body is `todo()`, so the first
-assertion in each file panics:
+The reference implementation is SQLite's pager and its write-ahead
+log. The rolling checksum is SQLite's own, and the salt rule and the
+commit-by-frame-size rule are its design.
 
-```
-$ novo test tests/pager_tests.nv
-  ✗ test_opening_a_file_that_is_not_there_says_which_one
-      not implemented: pager-nv.pager.open
-  0 passed, 1 failed
-```
+`pagefmt_tests.nv` asserts the whole format with no disk in it, which
+is what keeping `pagefmt` free of effects buys. Every function in
+`pager_tests.nv` and `driver_tests.nv` declares the effect row a real
+consumer will carry, so the cost of depending on this package is
+written out before anything depends on it. The suite checks that a
+torn final frame ends recovery and is dropped, that a frame from
+before the last checkpoint is not replayed, that a checkpoint is
+refused while a snapshot is held, that a free is deferred under one,
+that a nested `begin` is refused, and that a WAL whose page size
+differs from the database's is not read.
 
-The tests are the design under review, not a regression net.  Two of
-the four files are worth reading for a second reason: every function
-in `tests/pager_tests.nv` and `tests/driver_tests.nv` declares the
-effect row a real consumer will carry, so the cost of depending on
-this package is written out before anybody depends on it.
+The tests compile today and fail at run, each on the
+`not implemented: pager-nv.<module>.<fn>` panic that is its body. That
+is the expected state of an interface release. They turn green one at
+a time as bodies land.
 
-## Status
+## Implementation status
 
-| function | implemented |
+| Item | Implemented |
 | --- | --- |
-| `pagefmt.db_header_size`, `wal_header_size`, `wal_frame_header_size`, `default_page_size` | no |
-| `pagefmt.new_db_header`, `encode_db_header`, `decode_db_header` | no |
-| `pagefmt.encode_wal_header`, `decode_wal_header`, `encode_wal_frame`, `decode_wal_frame` | no |
-| `pagefmt.checksum_seed`, `checksum`, `frame_is_current`, `frame_offset` | no |
-| `pager.open`, `create`, `close` | no |
-| `pager.read_page`, `read_page_at`, `write_page`, `alloc_page`, `free_page` | no |
-| `pager.snapshot`, `release`, `begin`, `commit`, `rollback`, `checkpoint` | no |
-| `pager.header`, `page_size`, `page_count`, `stats`, `set_cache_limit` | no |
-| `pager.now_snapshot` | no |
-| `driver.execute`, `execute_script`, `next_row`, `step_once`, `answer` | no |
-| `driver.load_schema`, `store_schema` | no |
+| `pagefmt.db_header_size`, `.wal_header_size`, `.wal_frame_header_size`, `.default_page_size` | no |
+| `pagefmt.new_db_header`, `.encode_db_header`, `.decode_db_header` | no |
+| `pagefmt.encode_wal_header`, `.decode_wal_header`, `.encode_wal_frame`, `.decode_wal_frame` | no |
+| `pagefmt.checksum_seed`, `.checksum`, `.frame_is_current`, `.frame_offset` | no |
+| `pagefmt.FormatError.message` | no |
+| `pager.open`, `.create`, `.close` | no |
+| `pager.read_page`, `.read_page_at`, `.write_page`, `.alloc_page`, `.free_page` | no |
+| `pager.snapshot`, `.release`, `.begin`, `.commit`, `.rollback`, `.checkpoint` | no |
+| `pager.header`, `.page_size`, `.page_count`, `.stats`, `.set_cache_limit` | no |
+| `pager.now_snapshot`, `PagerError.message` | no |
+| `driver.execute`, `.execute_script`, `.next_row`, `.step_once`, `.answer` | no |
+| `driver.load_schema`, `.store_schema`, `DriveError.message` | no |
+
+## Licence
+
+Apache-2.0. See `LICENSE`.
+
+<!-- docs/writing-a-readme.md is the style guide for this page. -->
