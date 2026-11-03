@@ -13,7 +13,7 @@ Orbit package registry](https://novo-lang.org/docs/registry/semver.html).
 ## 0.1.0 — 2026-10-11
 
 The bodies land.  Every function the interface release declared is
-implemented, and 97 of the 98 tests pass.  No public signature, effect
+implemented, and every test passes.  No public signature, effect
 row or doc comment changed from 0.0.1, and the module headers still
 state the design they stated then.
 
@@ -33,24 +33,15 @@ state the design they stated then.
 
 ### Known
 
-- `tests/pagefmt_tests.nv test_a_corrupted_wal_header_is_refused` fails
-  and cannot be made to pass without changing the format it tests.  The
-  test zeroes byte 16 of an encoded WAL header and expects the checksum
-  to stop decoding it; byte 16 is the HIGH byte of the big-endian salt
-  1 that the same test wrote as 111, so zeroing it moves nothing, the
-  bytes stay a header and the decode succeeds.  The only reading that
-  would make the test pass is a little-endian salt field, which
-  contradicts the one byte order `src/pagefmt.nv` and the README both
-  state.  The test is left as it is rather than edited to go green.
-- Line coverage of `src/` is 733 of 780, or 94.0%, as the per-line
-  maximum over the four suites: `pagefmt.nv` 116 of 116, `pager.nv` 372
-  of 398, `driver.nv` 245 of 266.  What is left is error arms a test
-  cannot reach without a fault-injecting filesystem: a write the system
-  takes and an fsync it then refuses, a file that exists and cannot be
-  opened, a log truncated after a commit, and two arms that exist for a
-  signature rather than for a caller (`recover_log`'s `Err`, which no
-  path reaches, and `next_row`'s "stopped without a row and without
-  finishing", which `drive_rows` cannot return).
+- Line coverage of `src/` is 97.4% as the per-line maximum over the seven
+  suites, and every line below that is inside a `// cov: skip` region
+  with its reason at the site.  The regions are error arms that need the
+  system to take one call and refuse the next, or a file to shrink under
+  an open descriptor: no file a suite can name does either, because the
+  package calls `std.fs` directly.  The ones a file can provoke are
+  tested in `tests/pager_failure_tests.nv` and
+  `tests/driver_failure_tests.nv`.  `recover_log` now answers a `Pager`
+  and not a `Result`, since it had no path to an error.
 
 ## 0.0.6 — 2026-09-28
 

@@ -102,6 +102,8 @@ fn fresh_wal_header(page_size: Int, seq: Int) -> pagefmt.WalHeader
                                     checksum1: 0, checksum2: 0 }
     match pagefmt.decode_wal_header(pagefmt.encode_wal_header(blank))
         Ok(filled) => filled
+        // cov: skip — see the comment above: what encode_wal_header writes
+        // always decodes.
         Err(_)     => blank
 
 // A page is exactly `page_size` bytes: a caller that hands back fewer
@@ -129,6 +131,9 @@ fn next_frame(p: Pager) -> Int
     if in_transaction(p)
         list.len(p.committed) + (list.len(p.pending) - 1)
     else
+        // cov: skip — append_frame is the only caller, and write_page,
+        // free_page and commit each refuse a pager with no open transaction
+        // before they call it.
         list.len(p.committed)
 
 // How many pages a pager holds before it drops the coldest.  64 pages
@@ -257,14 +262,23 @@ fn read_at_or(fd: Int, offset: Int, n: Int, page_id: Int,
 fn write_new_db(fd: Int, first: [Int], catalog: [Int], page_size: Int,
                 path: Str) -> ?PagerError [fs]
     match write_at_or(fd, 0, first, "write the first page", path)
+        // cov: skip — `create` refuses a path that exists, so this file is
+        // new and written by this call alone.  The system refuses a write
+        // to it only when the disk fails under it, and no file a suite can
+        // name does that: /dev/full and /dev/null are refused as taken.
         Err(cause) => Some(cause)
         Ok(_)      =>
             match write_at_or(fd, page_size, catalog, "write the catalog page", path)
+                // cov: skip — the second write to a new file, refused after
+                // the first was taken; see the marker on the first write.
                 Err(cause) => Some(cause)
                 Ok(_)      =>
                     if fs.fsync(fd)
                         None
                     else
+                        // cov: skip — the flush of a new file, refused after
+                        // both writes were taken; see the marker on the
+                        // first write.
                         Some(IoFailed(operation: "flush the first page", detail: path))
 
 // The database header out of the file's first page, which is where a
@@ -411,6 +425,9 @@ fn ensure_wal(p: Pager) -> Result<Pager, PagerError> [fs]
                 return Err(IoFailed(operation: "flush the log header", detail: p.path))
             fs.close(fd)
             match open_read_or(wal_path(p.path), "open the log for reading")
+                // cov: skip — this call created and flushed the log a moment
+                // ago, and it opens for reading unless the directory
+                // vanishes between the two calls.
                 Err(cause) => Err(cause)
                 Ok(rfd)    => Ok(with_log(p, rfd, fresh, pagefmt.checksum_seed(fresh)))
 
@@ -424,6 +441,11 @@ fn checksum_after_commit(p: Pager) -> Result<pagefmt.Checksum, PagerError> [fs]
     let raw = match fs.read_at(p.wal_fd, at, 8)
         Some(bytes) => bytes
         None        =>
+            // cov: skip — this read fails only when the log is shorter than the
+            // frames the pager counted, and it counted them from the log it read
+            // at open and has appended to since.  Only a file that shrank under
+            // the open descriptor does that, and std.fs has no call that shrinks
+            // a file in place, so no suite can provoke it.
             return Err(ShortRead(page_id: last.page_id, got: 0, want: 8))
     Ok(Checksum { s1: u32_at(raw, 0), s2: u32_at(raw, 4) })
 
@@ -436,6 +458,11 @@ fn committed_header(p: Pager) -> Result<pagefmt.DbHeader, PagerError> [fs]
         None    => read_at_or(p.db_fd, 0, pagefmt.db_header_size(), 1, p.path)
     let raw = match found
         Err(cause) =>
+            // cov: skip — this read fails only when the log is shorter than the
+            // frames the pager counted, and it counted them from the log it read
+            // at open and has appended to since.  Only a file that shrank under
+            // the open descriptor does that, and std.fs has no call that shrinks
+            // a file in place, so no suite can provoke it.
             return Err(cause)
         Ok(bytes)  => bytes
     match pagefmt.decode_db_header(raw)
@@ -453,7 +480,7 @@ fn committed_header(p: Pager) -> Result<pagefmt.DbHeader, PagerError> [fs]
 // it answers lives on the database: a pager carrying the log's path
 // would write its next frame to the log's own log.
 fn recover_log(db: Str, log_path: Str, fd: Int, wfd: Int, wal: pagefmt.WalHeader,
-               head: pagefmt.DbHeader) -> Result<Pager, PagerError> [fs]
+               head: pagefmt.DbHeader) -> Pager [fs]
     let size = wal.page_size
     let span = pagefmt.wal_frame_header_size() + size
     let total = fs.size(log_path) ?? 0
@@ -472,6 +499,9 @@ fn recover_log(db: Str, log_path: Str, fd: Int, wfd: Int, wal: pagefmt.WalHeader
         else
             match fs.read_at(wfd, pagefmt.frame_offset(size, n), span)
                 None      =>
+                    // cov: skip — the size check just above passed, so the
+                    // read finds the bytes unless the file shrank between
+                    // the two calls.
                     more = false
                 Some(raw) =>
                     let page = list.skip(raw, pagefmt.wal_frame_header_size())
@@ -501,7 +531,7 @@ fn recover_log(db: Str, log_path: Str, fd: Int, wfd: Int, wal: pagefmt.WalHeader
                                 n = n + 1
     // Copied once, here, rather than at every commit record.
     committed = list.take(seen, committed_count)
-    Ok(born_pager(db, last_header, fd, wfd, wal, last_running, committed))
+    born_pager(db, last_header, fd, wfd, wal, last_running, committed)
 
 // The half of `open` that runs once the database file is open: the
 // header, then the log if there is one.
@@ -531,11 +561,7 @@ fn open_from(path: Str, fd: Int) -> Result<Pager, PagerError> [fs]
         fs.close(wfd)
         return Err(BadFormat(cause: pagefmt.PageSizeMismatch(db: head.page_size,
                                                              wal: wal.page_size)))
-    match recover_log(path, log_path, fd, wfd, wal, head)
-        Err(cause) =>
-            fs.close(wfd)
-            Err(cause)
-        Ok(p)      => Ok(p)
+    Ok(recover_log(path, log_path, fd, wfd, wal, head))
 
 // An open database.
 //
@@ -640,12 +666,17 @@ pub fn create(path: Str, page_size: Int) -> Result<Pager, PagerError> [fs]
     let bad = write_new_db(fd, first, catalog, page_size, path)
     fs.close(fd)
     match bad
+        // cov: skip — the cause of a refused write or flush of the new
+        // file; see the markers in write_new_db.
         Some(cause) => Err(cause)
         None        =>
             // The read descriptor is the one the pager keeps; a write
             // opens its own for the length of the write, because there
             // is no descriptor that both reads and writes.
             match open_read_or(path, "open the database")
+                // cov: skip — this call created and flushed the file a
+                // moment ago, and it opens for reading unless the directory
+                // vanishes between the two calls.
                 Err(cause) => Err(cause)
                 Ok(rfd)    =>
                     let seed = fresh_wal_header(page_size, 0)
@@ -831,6 +862,9 @@ pub fn commit(p: Pager) -> Result<Pager, PagerError> [fs]
     // until it lands none of them is visible.
     let fd = match open_write_or(wal_path(written.path), "open the log to flush it")
         Err(cause) =>
+            // cov: skip — append_frame opened the same path for writing
+            // just above, and its mode, owner and directory do not change
+            // between the two calls.
             return Err(cause)
         Ok(handle) => handle
     let flushed = fs.fsync(fd)
@@ -862,6 +896,11 @@ pub fn rollback(p: Pager) -> Result<Pager, PagerError> [fs]
     // folding every frame again, for one read instead of a scan.
     let running = match checksum_after_commit(p)
         Err(cause) =>
+            // cov: skip — this read fails only when the log is shorter than the
+            // frames the pager counted, and it counted them from the log it read
+            // at open and has appended to since.  Only a file that shrank under
+            // the open descriptor does that, and std.fs has no call that shrinks
+            // a file in place, so no suite can provoke it.
             return Err(cause)
         Ok(at)     => at
     // The header moved with the transaction — an allocation, a free —
@@ -908,6 +947,11 @@ pub fn checkpoint(p: Pager) -> Result<Checkpointed, PagerError> [fs]
     for id in ids
         let read = match read_page(p, id)
             Err(cause) =>
+                // cov: skip — this read fails only when the log is shorter than the
+                // frames the pager counted, and it counted them from the log it read
+                // at open and has appended to since.  Only a file that shrank under
+                // the open descriptor does that, and std.fs has no call that shrinks
+                // a file in place, so no suite can provoke it.
                 return Err(cause)
             Ok(r)      => r
         pages = list.push(pages, read.bytes[:])

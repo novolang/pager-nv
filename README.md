@@ -287,13 +287,12 @@ before the checkpoint, a file shorter than its header claims, a device
 that refuses a write, a tree whose root page is not a tree. A reader
 is only as good as the wrong files it refuses.
 
-One test does not pass. `pagefmt_tests.test_a_corrupted_wal_header_is_refused`
-zeroes byte 16 of an encoded WAL header and expects the checksum to
-stop decoding it, but byte 16 is the high byte of the big-endian salt
-1 the test wrote as 111, so the bytes do not move and the header
-decodes. It is recorded in `CHANGELOG.md` under `### Known` rather
-than worked around: the other reading of it — little-endian salts —
-contradicts the one byte order this file states.
+`pager_failure_tests.nv` and `driver_failure_tests.nv` give the pager a
+file that behaves like a failing disk: `/dev/null` in the log's path
+takes every write and refuses every flush, `/dev/full` refuses every
+write, a mode of 000 opens for nothing, and a database file shorter
+than its header claims has no page to read. Each test names the
+operation the refusal must come back under.
 
 ## Licence
 

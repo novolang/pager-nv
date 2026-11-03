@@ -1,0 +1,334 @@
+// driver_failure_tests.nv — a statement the file system will not let finish.
+//
+// The driver passes the pager's refusals up unchanged, one arm at each
+// place it asks the pager for something.  A refusal is provoked here
+// the way pager_failure_tests.nv does it, with a file in the log's
+// path that behaves like a failing disk:
+//
+//   /dev/full  refuses every write,
+//   /dev/null  takes every write and refuses every flush.
+//
+// And with a file that is shorter than its header says, for the read
+// that finds nothing there.
+//
+// The files are under /tmp and every test erases what it made.
+
+use std.test
+use std.list
+use std.str
+use pagefmt
+use pager
+use driver
+use sqlengine
+use pagefmt.{ DbHeader }
+
+fn scratch(name: Str) -> Str
+    "/tmp/pager-nv-driver-failure-" + name + ".db"
+
+fn log_of(db: Str) -> Str
+    db + "-wal"
+
+fn erase(name: Str) [fs]
+    let made = scratch(name)
+    let _ = fs.delete(made)
+    let _ = fs.delete(log_of(made))
+
+// A whole page: these bytes, then zeros.
+fn padded(bytes: [Int], size: Int) -> [Int]
+    var out = list.take(bytes, size)
+    while list.len(out) < size
+        out = list.push(out, 0)
+    out
+
+// A new file holding exactly these bytes.
+fn put_bytes(target: Str, bytes: [Int]) -> Bool [fs]
+    let _ = fs.delete(target)
+    let fd = match fs.open_write(target)
+        None    =>
+            return false
+        Some(f) => f
+    let bad = fs.write_at(fd, 0, bytes)
+    fs.close(fd)
+    match bad
+        None    => true
+        Some(_) => false
+
+// The device at the path, in place of whatever was there.
+fn replace_with(device: Str, path: Str) -> Bool [fs]
+    let _ = fs.delete(path)
+    fs.symlink(device, path)
+
+// A database whose catalog names one table, `a`, that has no tree yet,
+// and the pager that holds it; nothing when a step is refused.
+//
+// `CREATE TABLE` changes the schema and writes no page, so the schema
+// the statement hands back is stored and committed here, the way a
+// caller of the driver does it.
+fn table_in_the_catalog(name: Str) -> ?pager.Pager [fs]
+    erase(name)
+    let p = match pager.create(scratch(name), 4096)
+        Err(_) =>
+            return None
+        Ok(q)  => q
+    let made = match driver.execute(p, "CREATE TABLE a (id INTEGER)", [])
+        Err(_)  =>
+            return None
+        Ok(out) => out
+    let open_tx = match pager.begin(made.pager)
+        Err(_) =>
+            return None
+        Ok(q)  => q
+    let stored = match driver.store_schema(open_tx, made.schema)
+        Err(_) =>
+            return None
+        Ok(q)  => q
+    match pager.commit(stored)
+        Err(_) => None
+        Ok(q)  => Some(q)
+
+// The same, with one row in the table, so the table has a tree and the
+// next statement writes into it.
+fn table_with_a_row(name: Str) -> ?pager.Pager [fs]
+    match table_in_the_catalog(name)
+        None    => None
+        Some(p) =>
+            match driver.execute(p, "INSERT INTO a VALUES (1)", [])
+                Err(_)   => None
+                Ok(done) => Some(done.pager)
+
+// What a refusal of the file system comes back as, or the empty text
+// for any other outcome.
+fn storage_refusal(outcome: Result<driver.Executed, DriveError>) -> Str
+    match outcome
+        Ok(_)  => ""
+        Err(e) =>
+            match e
+                Storage(_) => "storage"
+                _          => e.message()
+
+@test
+fn test_a_table_whose_first_page_will_not_be_written_has_no_row_inserted() [fs, io]
+    // The first statement into a table gives it a tree and writes its
+    // empty root before the statement runs.  A log that refuses the
+    // write refuses the statement, on either entry point, and the
+    // caller hears the pager's word for it.
+    if fs.exists("/dev/full")
+        let p = match table_in_the_catalog("root-full")
+            None    =>
+                return test.fail("the table could not be made")
+            Some(q) => q
+        test.assert_true(replace_with("/dev/full", log_of(scratch("root-full"))),
+                         "the log becomes the full device")
+        test.assert_eq(storage_refusal(driver.execute(p, "INSERT INTO a VALUES (1)", [])), "storage")
+        test.assert_eq(storage_refusal(driver.execute_script(p, "INSERT INTO a VALUES (1)")), "storage")
+        let _ = pager.close(p)
+        erase("root-full")
+    else
+        test.assert_true(true, "this machine has no /dev/full to refuse a write")
+
+@test
+fn test_a_row_the_log_will_not_take_is_not_inserted() [fs, io]
+    // The write request is the engine's own: a tree that changed a leaf
+    // hands the new bytes to the host, and a refusal there ends the
+    // statement.
+    if fs.exists("/dev/full")
+        let p = match table_with_a_row("leaf-full")
+            None    =>
+                return test.fail("the table could not be made")
+            Some(q) => q
+        test.assert_true(replace_with("/dev/full", log_of(scratch("leaf-full"))),
+                         "the log becomes the full device")
+        test.assert_eq(storage_refusal(driver.execute(p, "INSERT INTO a VALUES (2)", [])), "storage")
+        test.assert_eq(storage_refusal(driver.execute_script(p, "INSERT INTO a VALUES (2)")), "storage")
+        let _ = pager.close(p)
+        erase("leaf-full")
+    else
+        test.assert_true(true, "this machine has no /dev/full to refuse a write")
+
+@test
+fn test_a_statement_whose_commit_will_not_flush_is_not_committed() [fs, io]
+    // The rows went in, and the flush that would make them visible was
+    // refused: the statement did not happen, and it says so, once as a
+    // statement and once as a script.
+    if fs.exists("/dev/null")
+        let p = match table_with_a_row("commit-null")
+            None    =>
+                return test.fail("the table could not be made")
+            Some(q) => q
+        test.assert_true(replace_with("/dev/null", log_of(scratch("commit-null"))),
+                         "the log becomes the null device")
+        test.assert_eq(storage_refusal(driver.execute(p, "INSERT INTO a VALUES (2)", [])), "storage")
+        test.assert_eq(storage_refusal(driver.execute_script(p, "INSERT INTO a VALUES (2)")), "storage")
+        let _ = pager.close(p)
+        erase("commit-null")
+    else
+        test.assert_true(true, "this machine has no /dev/null")
+
+@test
+fn test_a_catalog_page_the_file_does_not_hold_cannot_be_stored_to() [fs, io]
+    // The header names page 2 as the catalog, and the file stops after
+    // page 1: the read that comes before a store finds nothing, and the
+    // store says so.
+    erase("no-catalog")
+    let db = scratch("no-catalog")
+    let header = pagefmt.encode_db_header(DbHeader { version: 1, page_size: 4096, page_count: 2,
+                                                     freelist_head: 0, freelist_count: 0,
+                                                     change_counter: 0, schema_cookie: 0,
+                                                     catalog_root: 2 })
+    test.assert_true(put_bytes(db, padded(header, 4096)), "one page of a two-page database")
+    let p = match pager.open(db)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    match driver.store_schema(p, sqlengine.schema_new())
+        Ok(_)  =>
+            return test.fail("page 2 is not in the file")
+        Err(e) =>
+            match e
+                Storage(_) => test.assert_true(true, "the read that precedes the store found nothing")
+                _          =>
+                    return test.fail("that is what Storage is for")
+    match driver.execute(p, "SELECT 1", [])
+        Ok(_)  =>
+            return test.fail("the catalog is not in the file")
+        Err(e) =>
+            match e
+                Storage(_) => test.assert_true(true, "the statement cannot read its catalog")
+                _          =>
+                    return test.fail("that is what Storage is for")
+    let _ = pager.close(p)
+    erase("no-catalog")
+
+// A checkpointed database with one table and one row, closed, and a copy
+// of its first two pages: the header, which still counts three pages,
+// and the catalog, which still names the table's tree at page 3.  The
+// copy is the path, or nothing when a step is refused.
+fn database_missing_its_tree(name: Str) -> ?Str [fs]
+    let source = match table_with_a_row(name)
+        None    =>
+            return None
+        Some(q) => q
+    let moved = match pager.checkpoint(source)
+        Err(_) =>
+            return None
+        Ok(c)  => c
+    let _ = pager.close(moved.pager)
+    let fd = match fs.open_read(scratch(name))
+        None    =>
+            return None
+        Some(f) => f
+    let head = fs.read_at(fd, 0, 8192)
+    fs.close(fd)
+    let short = scratch(name + "-short")
+    let _ = fs.delete(short)
+    let _ = fs.delete(log_of(short))
+    match head
+        None        => None
+        Some(bytes) =>
+            if put_bytes(short, bytes)
+                Some(short)
+            else
+                None
+
+@test
+fn test_a_page_the_file_does_not_hold_ends_the_statement_that_reads_it() [fs, io]
+    // The catalog names a tree at page 3 and the file stops after page
+    // 2, so the first read the statement asks for finds nothing.  The
+    // refusal is the same however the caller drives the engine: to the
+    // end, one row at a time, or one step at a time.
+    let short = match database_missing_its_tree("tree-gone")
+        None    =>
+            return test.fail("the short copy could not be made")
+        Some(s) => s
+    let p = match pager.open(short)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    test.assert_eq(storage_refusal(driver.execute(p, "SELECT id FROM a", [])), "storage")
+    let loaded = match driver.load_schema(p)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(l)  => l
+    let engine = sqlengine.open(loaded.schema)
+    let st = match sqlengine.prepare(engine, "SELECT id FROM a")
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(s)  => s
+    match driver.next_row(loaded.pager, engine, st)
+        Ok(_)  =>
+            return test.fail("page 3 is not in the file")
+        Err(e) =>
+            match e
+                Storage(_) => test.assert_true(true, "one row at a time hears it as well")
+                _          =>
+                    return test.fail("that is what Storage is for")
+    let first = match driver.step_once(loaded.pager, engine, st)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(s)  => s
+    match driver.step_once(first.pager, first.engine, first.statement)
+        Ok(_)  =>
+            return test.fail("the step that was waiting for page 3 reads it first")
+        Err(e) =>
+            match e
+                Storage(_) => test.assert_true(true, "the read that precedes the repeated step failed")
+                _          =>
+                    return test.fail("that is what Storage is for")
+    let _ = pager.close(p)
+    erase("tree-gone")
+    erase("tree-gone-short")
+
+// A script of this many one-row inserts into `a`, enough to split the
+// table's tree into several pages.
+fn many_rows(n: Int) -> Str
+    str.join(list.map(0..n, i => "INSERT INTO a VALUES (" + str.from_int(i) + ")"), "; ")
+
+@test
+fn test_emptying_a_big_table_frees_its_pages_and_a_refused_free_is_reported() [fs, io]
+    let p = match table_in_the_catalog("empty")
+        None    =>
+            return test.fail("the table could not be made")
+        Some(q) => q
+    let filled = match driver.execute_script(p, many_rows(450))
+        Err(e)  =>
+            return test.fail(e.message())
+        Ok(out) => out
+    test.assert_true(pager.stats(filled.pager).wal_frames > 0, "the rows are in the log")
+    match driver.execute(filled.pager, "DELETE FROM a", [])
+        Err(e)  =>
+            return test.fail(e.message())
+        Ok(out) => test.assert_true(out.rows_affected > 0, "rows went")
+    if fs.exists("/dev/full")
+        test.assert_true(replace_with("/dev/full", log_of(scratch("empty"))),
+                         "the log becomes the full device")
+        test.assert_eq(storage_refusal(driver.execute(filled.pager, "DELETE FROM a", [])), "storage")
+    let _ = pager.close(p)
+    erase("empty")
+
+// The bytes of a text, then zeros, as a whole page.
+fn text_page(text: Str, size: Int) -> [Int]
+    padded(list.map(0..str.len(text), i => str.byte_at_or(text, i, 0)), size)
+
+@test
+fn test_a_table_that_needs_a_tree_when_the_free_list_cannot_be_read_is_refused() [fs, io]
+    // A table in the catalog with no tree is given one before the
+    // statement runs, and a database with a free list gives it the
+    // page at the head.  When the header names a head the file does not
+    // hold, the allocation fails and so does the statement.
+    erase("free-head")
+    let db = scratch("free-head")
+    let header = pagefmt.encode_db_header(DbHeader { version: 1, page_size: 4096, page_count: 3,
+                                                     freelist_head: 3, freelist_count: 1,
+                                                     change_counter: 0, schema_cookie: 0,
+                                                     catalog_root: 2 })
+    let catalog = text_page("table 0 1 0 CREATE TABLE a (id INTEGER)", 4096)
+    test.assert_true(put_bytes(db, list.concat(padded(header, 4096), catalog)),
+                     "two pages of a three-page database")
+    let p = match pager.open(db)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    test.assert_eq(storage_refusal(driver.execute(p, "SELECT id FROM a", [])), "storage")
+    test.assert_eq(storage_refusal(driver.execute_script(p, "SELECT id FROM a")), "storage")
+    let _ = pager.close(p)
+    erase("free-head")

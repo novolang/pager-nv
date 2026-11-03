@@ -1,0 +1,225 @@
+// pager_failure_tests.nv — the system calls that answer no.
+//
+// The pager reports every refusal of the file system as an
+// `IoFailed` that names the operation, and none of those refusals can
+// be provoked with a fault-injecting file system, because the package
+// opens its files itself.  What a test can do is put a file in the
+// path that behaves the way a failing disk does:
+//
+//   /dev/null  takes every write and refuses every flush,
+//   mode 000   opens for nothing, whatever the file holds.
+//
+// Each test names the operation the refusal must come back under, so a
+// refusal that is swallowed, or reported under another operation's
+// name, fails the test.
+//
+// The files are under /tmp and every test erases what it made.
+
+use std.test
+use std.list
+use pager
+
+fn scratch(name: Str) -> Str
+    "/tmp/pager-nv-failure-" + name + ".db"
+
+fn log_of(db: Str) -> Str
+    db + "-wal"
+
+// The file this test wrote, gone, so the next run of the suite starts
+// where this one did.  A file left at mode 000 is made readable first,
+// because a delete does not need the mode but a leftover that no one
+// can read is a trap for the person who looks.
+fn erase(name: Str) [fs]
+    let made = scratch(name)
+    let _ = fs.set_file_mode(made, 0o600)
+    let _ = fs.set_file_mode(log_of(made), 0o600)
+    let _ = fs.delete(made)
+    let _ = fs.delete(log_of(made))
+
+// A whole page: these bytes, then zeros.
+fn padded(bytes: [Int], size: Int) -> [Int]
+    var out = list.take(bytes, size)
+    while list.len(out) < size
+        out = list.push(out, 0)
+    out
+
+// What a refusal says it was doing, or the empty text for an answer
+// that is not a refusal of the system.
+fn refused_under(e: PagerError) -> Str
+    match e
+        IoFailed(operation, _) => operation
+        _                      => ""
+
+// A database with one committed page written, its log in place, and the
+// pager that holds it: the starting point of every test that needs a
+// log with something in it.
+fn committed_database(name: Str, fill: Int) -> Result<pager.Pager, PagerError> [fs]
+    erase(name)
+    let p = pager.create(scratch(name), 4096)!
+    let open_tx = pager.begin(p)!
+    let wrote = pager.write_page(open_tx, 2, padded([fill], 4096))!
+    pager.commit(wrote)
+
+// Put the device at the path, in place of whatever was there.
+fn replace_with_null(path: Str) -> Bool [fs]
+    let _ = fs.delete(path)
+    fs.symlink("/dev/null", path)
+
+@test
+fn test_a_log_whose_header_will_not_flush_is_a_storage_error() [fs, io]
+    // The log is created at the first write, and its header is flushed
+    // before a frame goes in behind it.  A log that takes the header
+    // and refuses the flush has not made the header durable, and a
+    // frame written behind it would be a frame nobody can find.
+    if fs.exists("/dev/null")
+        erase("log-header")
+        let p = match pager.create(scratch("log-header"), 4096)
+            Err(e) =>
+                return test.fail(e.message())
+            Ok(p)  => p
+        test.assert_true(fs.symlink("/dev/null", log_of(scratch("log-header"))),
+                         "the log path becomes the null device")
+        let open_tx = match pager.begin(p)
+            Err(e) =>
+                return test.fail(e.message())
+            Ok(q)  => q
+        match pager.free_page(open_tx, 2)
+            Ok(_)  =>
+                return test.fail("the device refuses every flush")
+            Err(e) =>
+                test.assert_eq(refused_under(e), "flush the log header")
+        let _ = pager.close(p)
+        erase("log-header")
+    else
+        test.assert_true(true, "this machine has no /dev/null")
+
+@test
+fn test_a_commit_whose_log_will_not_flush_is_a_storage_error() [fs, io]
+    // The commit is one flush of the log, and until it lands none of
+    // the transaction is visible.  A flush the system refuses is a
+    // commit that did not happen, and the caller hears it under the
+    // commit's own name.
+    if fs.exists("/dev/null")
+        erase("commit-flush")
+        let p = match pager.create(scratch("commit-flush"), 4096)
+            Err(e) =>
+                return test.fail(e.message())
+            Ok(p)  => p
+        let open_tx = match pager.begin(p)
+            Err(e) =>
+                return test.fail(e.message())
+            Ok(q)  => q
+        let wrote = match pager.write_page(open_tx, 2, padded([61], 4096))
+            Err(e) =>
+                return test.fail(e.message())
+            Ok(q)  => q
+        test.assert_true(replace_with_null(log_of(scratch("commit-flush"))),
+                         "the log becomes the null device")
+        match pager.commit(wrote)
+            Ok(_)  =>
+                return test.fail("the device refuses every flush")
+            Err(e) =>
+                test.assert_eq(refused_under(e), "flush the log at the commit")
+        let _ = pager.close(p)
+        erase("commit-flush")
+    else
+        test.assert_true(true, "this machine has no /dev/null")
+
+@test
+fn test_a_checkpoint_whose_database_will_not_flush_leaves_the_log_alone() [fs, io]
+    // The database file has to be durable before the header that retires
+    // the frames is written, so a flush the system refuses stops the
+    // checkpoint with the frames still the only copy.
+    if fs.exists("/dev/null")
+        let committed = match committed_database("ck-db-flush", 71)
+            Err(e) =>
+                return test.fail(e.message())
+            Ok(q)  => q
+        test.assert_true(replace_with_null(scratch("ck-db-flush")),
+                         "the database path becomes the null device")
+        match pager.checkpoint(committed)
+            Ok(_)  =>
+                return test.fail("the device refuses every flush")
+            Err(e) =>
+                test.assert_eq(refused_under(e), "flush the database at the checkpoint")
+        test.assert_true(pager.stats(committed).wal_frames > 0, "the frames are still in the log")
+        let _ = pager.close(committed)
+        erase("ck-db-flush")
+    else
+        test.assert_true(true, "this machine has no /dev/null")
+
+@test
+fn test_a_checkpoint_whose_new_log_header_will_not_flush_is_a_storage_error() [fs, io]
+    // The pages are in the database by now; what is left is the header
+    // that tells a later open the frames are spent.  Without its flush
+    // the old frames would be replayed over the checkpointed file, so
+    // the refusal is reported rather than assumed away.
+    if fs.exists("/dev/null")
+        let committed = match committed_database("ck-log-flush", 72)
+            Err(e) =>
+                return test.fail(e.message())
+            Ok(q)  => q
+        test.assert_true(replace_with_null(log_of(scratch("ck-log-flush"))),
+                         "the log becomes the null device")
+        match pager.checkpoint(committed)
+            Ok(_)  =>
+                return test.fail("the device refuses every flush")
+            Err(e) =>
+                test.assert_eq(refused_under(e), "flush the log header")
+        let _ = pager.close(committed)
+        erase("ck-log-flush")
+    else
+        test.assert_true(true, "this machine has no /dev/null")
+
+@test
+fn test_a_checkpoint_whose_log_will_not_open_for_writing_is_a_storage_error() [fs, io]
+    // After the pages are flushed the log is opened to take its fresh
+    // header.  A log that has become a directory opens for nothing.
+    let committed = match committed_database("ck-log-open", 73)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    test.assert_true(fs.delete(log_of(scratch("ck-log-open"))), "the log is removed")
+    test.assert_true(fs.mkdir(log_of(scratch("ck-log-open"))), "a directory takes its place")
+    match pager.checkpoint(committed)
+        Ok(_)  =>
+            return test.fail("the log has nowhere to take its header")
+        Err(e) =>
+            test.assert_eq(refused_under(e), "open the log for the checkpoint")
+    let _ = fs.delete(log_of(scratch("ck-log-open")))
+    let _ = pager.close(committed)
+    erase("ck-log-open")
+
+@test
+fn test_a_log_the_system_will_not_open_stops_the_open() [fs, io]
+    // A log that exists is a log that has to be read, because it may
+    // hold committed frames the database file does not.  A log nobody
+    // may read cannot be skipped, so the open fails and names the log.
+    let committed = match committed_database("log-mode", 74)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    let _ = pager.close(committed)
+    test.assert_true(fs.set_file_mode(log_of(scratch("log-mode")), 0o000), "the log is closed to everyone")
+    match pager.open(scratch("log-mode"))
+        Ok(_)  =>
+            return test.fail("the log cannot be read")
+        Err(e) =>
+            test.assert_eq(refused_under(e), "open the log")
+    erase("log-mode")
+
+@test
+fn test_a_database_the_system_will_not_open_is_a_storage_error() [fs, io]
+    erase("db-mode")
+    let p = match pager.create(scratch("db-mode"), 4096)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(p)  => p
+    let _ = pager.close(p)
+    test.assert_true(fs.set_file_mode(scratch("db-mode"), 0o000), "the file is closed to everyone")
+    match pager.open(scratch("db-mode"))
+        Ok(_)  =>
+            return test.fail("the file cannot be read")
+        Err(e) =>
+            test.assert_eq(refused_under(e), "open the database")
+    erase("db-mode")
