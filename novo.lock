@@ -4,12 +4,9 @@
 source = "registry"
 url = "https://registry.novo-lang.org"
 req = "^0.1.0"
-version = "0.1.0"
-hash = "d7aa0e8875a1c58721c97969ce92ee61564afa5b7cea3300b218142901b9ee18"
+version = "0.1.1"
+hash = "0658ab834d4db3ec0e6224482f568a32e0174735669d1113892d4eab9ff97e18"
 
 [sql-engine-nv]
-source = "registry"
-url = "https://registry.novo-lang.org"
-req = "^0.0.6"
-version = "0.0.6"
-hash = "1f9a7681ce095c568d588220766fcd0dd95c7d72ea9986384b63853c9ba4f763"
+source = "path"
+path = "../sql-engine-nv"

@@ -1,8 +1,5 @@
 // driver_tests.nv — the join between two `core` packages and a file.
 //
-// EVERY TEST HERE FAILS TODAY: pager-nv is published as its interface
-// and every body is `todo()`.
-//
 // WHAT THIS FILE IS REALLY CHECKING IS THE EFFECT ARITHMETIC, and it
 // checks it by compiling.  Every function below declares `[fs]` and
 // gets it from `pager` and `driver`; NOTHING it calls in
@@ -21,8 +18,13 @@ use sqlengine
 use pager
 use driver
 
-fn scratch(name: Str) -> Str
-    "/tmp/pager-nv-driver-" + name + ".db"
+// A path under /tmp with nothing at it: `pager.create` refuses a path
+// that is taken, so a file an earlier run left is removed first.
+fn scratch(name: Str) -> Str [fs]
+    let path = "/tmp/pager-nv-driver-" + name + ".db"
+    let _ = fs.delete(path)
+    let _ = fs.delete(path + "-wal")
+    path
 
 @test
 fn test_execute_is_the_whole_package_from_an_application_s_side() [fs, io]

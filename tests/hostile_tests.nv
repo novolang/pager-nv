@@ -1,0 +1,89 @@
+// hostile_tests.nv — a log in which every frame is a commit record.
+
+use std.test
+use std.list
+use std.fs
+use std.time
+use pagefmt
+use pager
+use pagefmt.{ Checksum, WalFrame, WalHeader }
+
+fn scratch() -> Str
+    "/tmp/pager-nv-hostile.db"
+
+fn erase() [fs]
+    let _ = fs.delete(scratch())
+    let _ = fs.delete(scratch() + "-wal")
+
+fn word_at(raw: [Int], at: Int) -> Int
+    (list.get(raw, at, 0) << 24) | (list.get(raw, at + 1, 0) << 16)
+        | (list.get(raw, at + 2, 0) << 8) | list.get(raw, at + 3, 0)
+
+// A log of `frames` frames of page 2, each of which declares the
+// database two pages long, so that each is a commit record.
+fn write_log(db: Str, frames: Int) -> Bool [fs]
+    let head = WalHeader { version: 1, page_size: 512, checkpoint_seq: 0,
+                                   salt1: 1, salt2: 2, checksum1: 0, checksum2: 0 }
+    let header_bytes = pagefmt.encode_wal_header(head)
+    let sealed = match pagefmt.decode_wal_header(header_bytes)
+        Ok(h)  => h
+        Err(_) => head
+    let fd = match fs.open_write(db + "-wal")
+        Some(h) => h
+        None    =>
+            return false
+    var ok = fs.write_at(fd, 0, header_bytes) == None
+    var running = pagefmt.checksum_seed(sealed)
+    let page = list.zeros(512)
+    var batch: [Int] = []
+    var batch_at = pagefmt.frame_offset(512, 0)
+    var n = 0
+    while n < frames
+        let frame = WalFrame { page_id: 2, db_size_after: 2, salt1: 1, salt2: 2,
+                               checksum1: 0, checksum2: 0 }
+        let raw = pagefmt.encode_wal_frame(frame, page, running)
+        running = Checksum { s1: word_at(raw, 16), s2: word_at(raw, 20) }
+        batch = list.append(batch, raw)
+        n = n + 1
+        if list.len(batch) >= 512 * 1024 or n == frames
+            ok = ok and fs.write_at(fd, batch_at, batch) == None
+            batch_at = pagefmt.frame_offset(512, n)
+            batch = []
+    fs.close(fd)
+    ok
+
+@test
+fn test_a_log_of_many_commit_records_is_recovered_in_linear_time() [io, fs, time]
+    erase()
+    let made = pager.create(scratch(), 512)
+    match made
+        Err(_) => test.fail("create")
+        Ok(p)  =>
+            let _ = pager.close(p)
+            test.assert(write_log(scratch(), 120000))
+            let started = time.now()
+            let opened = pager.open(scratch())
+            let took = time.now() - started
+            match opened
+                Err(_) => test.fail("the log is well formed")
+                Ok(q)  =>
+                    // Recovery reads 120000 frames; copying the frame list at every commit takes far longer.
+                    test.assert(took < 12.0)
+                    test.assert(pager.stats(q).wal_frames == 120000)
+                    let _ = pager.close(q)
+    erase()
+
+@test
+fn test_a_log_with_two_commit_records_is_recovered() [io, fs]
+    erase()
+    match pager.create(scratch(), 512)
+        Err(_) => test.fail("create")
+        Ok(p)  =>
+            let _ = pager.close(p)
+            test.assert(write_log(scratch(), 2))
+            match pager.open(scratch())
+                Err(_) => test.fail("the log is well formed")
+                Ok(q)  =>
+                    test.assert(pager.stats(q).wal_frames == 2)
+                    let _ = pager.close(q)
+    erase()

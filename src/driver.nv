@@ -36,11 +36,400 @@
 // file gains them; nothing in the signatures below has to change,
 // which is the argument for having published both shapes.
 
+use std.list
+use std.str
 use btree
 use btcell
+use nodefmt
 use sqlast
 use sqlengine
+use sqltok
 use pager
+// The four names this module builds rather than only reads: a struct
+// literal takes an imported name, because the grammar has no qualified
+// literal.
+use pager.{ Answered }
+use nodefmt.{ Leaf }
+use sqlast.{ StCreateTable }
+use sqlengine.{ Schema, TableDef }
+
+// ── answering a request ──────────────────────────────────────────────
+
+// A pager and an engine that have just been through one request.
+//
+// The two move together — a read moves the pager's cache and the
+// engine's fed pages — so they are threaded as one value rather than
+// returned as a pair no signature can name.
+struct DriverState
+    pager: pager.Pager
+    engine: sqlengine.Engine
+
+// The pager's error as this module's.
+//
+// `!` propagates an error value and never converts one, so every
+// crossing between the two error types is written out rather than
+// left to the operator.
+fn stored_pager(r: Result<pager.Pager, pager.PagerError>) -> Result<pager.Pager, DriveError>
+    match r
+        Ok(value)  => Ok(value)
+        Err(cause) => Err(Storage(cause: cause))
+
+// The same for a read, whose payload is a page and not a pager.
+fn stored_read(r: Result<pager.PageRead, pager.PagerError>) -> Result<pager.PageRead, DriveError>
+    match r
+        Ok(value)  => Ok(value)
+        Err(cause) => Err(Storage(cause: cause))
+
+// The same for an allocation, which answers an id.
+fn stored_alloc(r: Result<pager.PageAlloc, pager.PagerError>) -> Result<pager.PageAlloc, DriveError>
+    match r
+        Ok(value)  => Ok(value)
+        Err(cause) => Err(Storage(cause: cause))
+
+// One page read, as the `Answered` a caller sees.  The page id is zero
+// because the caller asked with one and does not need it back.
+fn read_request(p: pager.Pager, page_id: Int) -> Result<pager.Answered, DriveError> [fs]
+    let read = match stored_read(pager.read_page(p, page_id))
+        Err(cause) =>
+            return Err(cause)
+        Ok(got)    => got
+    Ok(Answered { pager: read.pager, page: read.bytes, page_id: 0 })
+
+// One page written.  A write answers no bytes and no id.
+fn write_request(p: pager.Pager, page_id: Int,
+                 bytes: [Int]) -> Result<pager.Answered, DriveError> [fs]
+    let q = match stored_pager(pager.write_page(p, page_id, bytes))
+        Err(cause) =>
+            return Err(cause)
+        Ok(q)      => q
+    Ok(Answered { pager: q, page: [], page_id: 0 })
+
+// One page allocated: an id, and no bytes.
+fn alloc_request(p: pager.Pager, kind: Int) -> Result<pager.Answered, DriveError> [fs]
+    let a = match stored_alloc(pager.alloc_page(p, kind))
+        Err(cause) =>
+            return Err(cause)
+        Ok(a)      => a
+    Ok(Answered { pager: a.pager, page: [], page_id: a.page_id })
+
+// One page freed.  A free is a frame in the log like any other, so
+// nothing comes back but the pager that recorded it.
+fn free_request(p: pager.Pager, page_id: Int) -> Result<pager.Answered, DriveError> [fs]
+    let q = match stored_pager(pager.free_page(p, page_id))
+        Err(cause) =>
+            return Err(cause)
+        Ok(q)      => q
+    Ok(Answered { pager: q, page: [], page_id: 0 })
+
+// A read performed and handed straight to the engine.
+//
+// Separate from `answer_request` because `step_once` is given a page id
+// and not a request: the engine records the page it is waiting for, and
+// this is the half of the protocol that reads that back out.
+fn feed_read(p: pager.Pager, e: sqlengine.Engine,
+             page_id: Int) -> Result<DriverState, DriveError> [fs]
+    let read = match stored_read(pager.read_page(p, page_id))
+        Err(cause) =>
+            return Err(cause)
+        Ok(got)    => got
+    Ok(DriverState { pager: read.pager,
+                     engine: sqlengine.feed_page(e, page_id, read.bytes) })
+
+// The page the engine is waiting for, as an `Int` with zero for none.
+//
+// Zero is not a page id, so a caller that only tests it has nothing to
+// unwrap.
+fn awaiting_page_of(e: sqlengine.Engine) -> Int
+    match sqlengine.awaiting(e)
+        Some(page_id) => page_id
+        None          => 0
+
+// Perform whatever the engine asked for and hand the answer back.
+//
+// This is the whole contract between a `core` package and a `host` one:
+// a read is fed as bytes, an allocation as an id, and a write or a free
+// is performed and answered with the engine unchanged, because the
+// pager has already done the thing the request names.
+fn answer_request(p: pager.Pager, e: sqlengine.Engine,
+                  request: btree.PageRequest) -> Result<DriverState, DriveError> [fs]
+    match request
+        PrNeedPage(page_id)         =>
+            let a = match read_request(p, page_id)
+                Err(cause) =>
+                    return Err(cause)
+                Ok(a)      => a
+            Ok(DriverState { pager: a.pager,
+                             engine: sqlengine.feed_page(e, page_id, a.page) })
+        PrWritePage(page_id, bytes) =>
+            let a = match write_request(p, page_id, bytes)
+                Err(cause) =>
+                    return Err(cause)
+                Ok(a)      => a
+            Ok(DriverState { pager: a.pager, engine: e })
+        PrAllocPage(kind)           =>
+            let a = match alloc_request(p, kind)
+                Err(cause) =>
+                    return Err(cause)
+                Ok(a)      => a
+            Ok(DriverState { pager: a.pager, engine: sqlengine.feed_alloc(e, a.page_id) })
+        PrFreePage(page_id)         =>
+            let a = match free_request(p, page_id)
+                Err(cause) =>
+                    return Err(cause)
+                Ok(a)      => a
+            Ok(DriverState { pager: a.pager, engine: e })
+
+// How many times the driver will step a statement before deciding it is
+// not going to finish.
+//
+// A state machine that loops is a bug, and a million steps is far past
+// any statement that is making progress, so the guard costs a caller
+// with a slow disk nothing and fails a caller with a broken engine in
+// seconds.
+fn step_budget() -> Int
+    1000000
+
+// A statement mid-run: what it has produced, and what it takes to
+// continue it.
+struct DrivenRun
+    pager: pager.Pager
+    engine: sqlengine.Engine
+    statement: sqlengine.Statement
+    columns: [Str]
+    rows: [[btcell.Cell]]
+    rows_affected: Int
+    // True once the statement answered `SrDone`.  False with rows in
+    // hand is a statement that was stopped early, which is what
+    // `next_row` leaves behind.
+    finished: Bool
+
+// Step a statement, answering every page it asks for, until it finishes
+// or has answered `keep` rows.  A `keep` of zero means all of them.
+//
+// The loop is here rather than written out twice because `execute` and
+// `next_row` differ in one number and in what they do with the result,
+// and a second copy of a state machine is a second place for it to be
+// wrong.
+fn drive_rows(p: pager.Pager, e: sqlengine.Engine, st: sqlengine.Statement,
+              keep: Int) -> Result<DrivenRun, DriveError> [fs]
+    var state = DriverState { pager: p, engine: e }
+    var current = st
+    var rows: [[btcell.Cell]] = []
+    var affected = 0
+    var finished = false
+    var paused = false
+    var steps = step_budget()
+    while not finished and not paused and steps > 0
+        steps = steps - 1
+        let adv = sqlengine.step(state.engine, current)
+        state = DriverState { pager: state.pager, engine: adv.engine }
+        current = adv.statement
+        match adv.result
+            SrRow(row)    =>
+                rows = list.push(rows, row[:])
+                if keep > 0 and list.len(rows) >= keep
+                    // The caller asked for one row and has it; the
+                    // statement is left standing where it is.
+                    paused = true
+            SrDone(count) =>
+                affected = count
+                finished = true
+            SrError(err)  =>
+                return Err(Engine(cause: err))
+            SrPage(req)   =>
+                match answer_request(state.pager, state.engine, req)
+                    Err(cause) =>
+                        return Err(cause)
+                    Ok(next)   =>
+                        state = next
+    if not finished and not paused
+        // Out of budget with the statement still asking for something:
+        // it is looping, and the caller hears that rather than waiting
+        // for a process that never returns.
+        return Err(Stalled(steps: step_budget()))
+    Ok(DrivenRun { pager: state.pager, engine: state.engine, statement: current,
+                   columns: sqlengine.columns(current), rows: rows,
+                   rows_affected: affected, finished: finished })
+
+// The transaction a statement ran in, closed the way its writes call
+// for: a commit when pages moved, a rollback when none did.
+//
+// A statement that wrote nothing has nothing to commit, and a commit
+// with no frames would still bump the change counter — a header write
+// and a frame every reader has to notice.  Leaving it alone keeps a
+// read a read.
+fn settle_statement(before: pager.PagerStats, after: pager.PagerStats,
+                    p: pager.Pager) -> Result<pager.Pager, DriveError> [fs]
+    if after.writes > before.writes
+        stored_pager(pager.commit(p))
+    else
+        stored_pager(pager.rollback(p))
+
+// A schema whose tables all have a tree to live in, and whether any of
+// them needed one.
+struct Rooted
+    pager: pager.Pager
+    schema: sqlengine.Schema
+    changed: Bool
+
+// Give every table without a tree one, inside the caller's transaction.
+//
+// A `CREATE TABLE` is not a write: sql-engine-nv's schema says a new
+// table's root is page zero and that the host allocates the tree once
+// it has read the schema back.  This is that allocation, done before
+// the engine is opened so that the engine never sees a root of zero —
+// a tree at page zero is a request for a page no file has.
+fn prepare_tables(p: pager.Pager, s: sqlengine.Schema) -> Result<Rooted, DriveError> [fs]
+    var q = p
+    var changed = false
+    var tables: [sqlengine.TableDef] = []
+    for t in s.tables
+        var root = t.root_page
+        if root == 0
+            // The pager does not use the kind hint: it is here because
+            // the request is btree-nv's and a root is a leaf.
+            let a = match stored_alloc(pager.alloc_page(q, nodefmt.KIND_LEAF))
+                Err(cause) =>
+                    return Err(cause)
+                Ok(a)      => a
+            root = a.page_id
+            // A page nobody has written is a page a reader cannot tell
+            // from one that lost its bytes, and the tree's first read
+            // of its own root is a read of this page.  An empty leaf is
+            // what a tree with no rows in it is.
+            let blank = match nodefmt.encode_leaf(root, Leaf { keys: [], rows: [] })
+                Err(cause) =>
+                    return Err(Protocol(detail: "the tree refused an empty page: " + cause.message()))
+                Ok(bytes)  => bytes
+            q = match stored_pager(pager.write_page(a.pager, root, blank))
+                Err(cause) =>
+                    return Err(cause)
+                Ok(next)   => next
+            changed = true
+        tables = list.push(tables, TableDef { name: t.name, columns: t.columns[:],
+                                              checks: t.checks[:],
+                                              foreign_keys: t.foreign_keys[:],
+                                              root_page: root, next_rowid: t.next_rowid,
+                                              auto_increment_high: t.auto_increment_high })
+    Ok(Rooted { pager: q, schema: Schema { tables: tables, views: s.views,
+                                           triggers: s.triggers, indexes: s.indexes },
+                changed: changed })
+
+// ── the catalog page on disk ─────────────────────────────────────────
+
+// The catalog is one page, and a line of it is
+//
+//     table <root> <next rowid> <high water> CREATE TABLE ...
+//
+// — the numbers a `TableDef` carries that the SQL text does not, then
+// the statement that rebuilds the rest.  A schema is written inside the
+// transaction that changed it and read back by `open`, where
+// sql-engine-nv's `Schema` is the shape the walk has to produce.
+fn catalog_text(s: sqlengine.Schema) -> Str
+    var lines: [Str] = []
+    for t in s.tables
+        let body = sqlast.show_stmt(StCreateTable(name: t.name, columns: t.columns,
+                                                 checks: t.checks,
+                                                 foreign_keys: t.foreign_keys,
+                                                 if_not_exists: false))
+        lines = list.push(lines, "table " + str.from_int(t.root_page) + " "
+                                 + str.from_int(t.next_rowid) + " "
+                                 + str.from_int(t.auto_increment_high) + " " + body)
+    str.join(lines, "\n")
+
+// The text a catalog page holds: the bytes up to the first zero.
+//
+// A page is written zeroed past the text, so a reader stops at the
+// first zero rather than at the page's end, and a page nobody has
+// written reads as an empty catalog.
+fn page_text(bytes: [Int]) -> Str
+    let sb = str.builder_new()
+    var i = 0
+    var going = true
+    while i < list.len(bytes) and going
+        let b = list.get(bytes, i, 0)
+        if b == 0
+            going = false
+        else
+            str.builder_append_char(sb, b)
+        i = i + 1
+    let text = str.builder_to_str(sb)
+    str.builder_drop(sb)
+    text
+
+// The page bytes a catalog text becomes: the text, then zeros to the
+// end of the page.
+fn page_bytes(text: Str, size: Int) -> [Int]
+    var out: [Int] = []
+    var i = 0
+    while i < str.len(text) and i < size
+        out = list.push(out, str.byte_at_or(text, i, 0))
+        i = i + 1
+    while list.len(out) < size
+        out = list.push(out, 0)
+    out
+
+// The schema these lines describe.
+//
+// A line the parser does not recognise is this package's own page being
+// wrong or another build's, which is a protocol error and not a
+// caller's mistake, so it is refused with the line rather than skipped.
+fn schema_of_text(text: Str) -> Result<sqlengine.Schema, DriveError>
+    var tables: [sqlengine.TableDef] = []
+    for line in str.lines(text)
+        let parts = str.words(line)
+        if list.len(parts) >= 5 and list.get(parts, 0, "") == "table"
+            let body = str.join(list.skip(parts, 4), " ")
+            let parsed = sqlast.parse(body)
+            if list.len(parsed.errors) > 0
+                return Err(Protocol(detail: "the catalog page holds a table statement this build cannot read: " + body))
+            match parsed.stmt
+                StCreateTable(name, columns, checks, foreign_keys, _) =>
+                    tables = list.push(tables, TableDef {
+                        name: name, columns: columns, checks: checks,
+                        foreign_keys: foreign_keys,
+                        root_page: str.to_int(list.get(parts, 1, "0")) ?? 0,
+                        next_rowid: str.to_int(list.get(parts, 2, "1")) ?? 1,
+                        auto_increment_high: str.to_int(list.get(parts, 3, "0")) ?? 0 })
+                _                                                     =>
+                    return Err(Protocol(detail: "the catalog page holds a line that is not a table: " + body))
+        else if str.len(str.trim(line)) > 0
+            return Err(Protocol(detail: "the catalog page holds a line this build cannot read: " + line))
+    Ok(Schema { tables: tables, views: [], triggers: [], indexes: [] })
+
+// ── the loop, and its pieces ─────────────────────────────────────────
+
+// The statements of a script: the tokens up to each `;`, rendered back
+// into the text the parser takes.
+//
+// The split is over TOKENS and not over characters, so a `;` inside a
+// string literal is one token of its own and separates nothing.  A
+// trailing statement without a `;` is a statement, because that is what
+// a caller who typed one line meant.
+fn split_script(sql: Str) -> [Str]
+    var out: [Str] = []
+    var current: [sqltok.Token] = []
+    for t in sqltok.lex(sql)
+        if t.kind == TkPunct and t.text == ";"
+            let text = str.trim(sqltok.show(current))
+            if str.len(text) > 0
+                out = list.push(out, text)
+            current = []
+        else if t.kind != TkEnd
+            current = list.push(current, t)
+    let tail = str.trim(sqltok.show(current))
+    if str.len(tail) > 0
+        out = list.push(out, tail)
+    out
+
+// The transaction undone, and the failure the caller asked for.
+//
+// A rollback that itself fails is the worse news of the two and is what
+// comes back; an error the caller cannot see is not worth reporting.
+fn failed_script(p: pager.Pager, cause: DriveError) -> Result<Executed, DriveError> [fs]
+    match pager.rollback(p)
+        Err(store) => Err(Storage(cause: store))
+        Ok(_)      => Err(cause)
 
 // Run one statement to completion and collect its rows.
 //
@@ -60,7 +449,53 @@ use pager
 //                 Err(e)  => println(e.message())
 // ```
 pub fn execute(p: pager.Pager, sql: Str, params: [btcell.Cell]) -> Result<Executed, DriveError> [fs]
-    todo("pager-nv.driver.execute")
+    // The engine publishes no way to bind a parameter, so a caller who
+    // passed one hears that instead of being quietly answered for the
+    // values they did not get.
+    if list.len(params) > 0
+        return Err(Protocol(detail: "this build runs a statement's own text; parameters are not bound yet"))
+    let loaded = match load_schema(p)
+        Err(cause) =>
+            return Err(cause)
+        Ok(got)    => got
+    // The transaction is opened here and not by the caller: a statement
+    // that writes has to have one, and one that only reads is not
+    // charged for it — a begin with no frames is a marker in memory,
+    // not a byte in a file.  A failure below leaves the caller's own
+    // pager untouched, because a pager is a value.
+    let began = match stored_pager(pager.begin(loaded.pager))
+        Err(cause) =>
+            return Err(cause)
+        Ok(q)      => q
+    let rooted = match prepare_tables(began, loaded.schema)
+        Err(cause) =>
+            return Err(cause)
+        Ok(got)    => got
+    let engine = sqlengine.open(rooted.schema)
+    let st = match sqlengine.prepare(engine, sql)
+        Err(cause) =>
+            return Err(Engine(cause: cause))
+        Ok(st)     => st
+    var q = rooted.pager
+    if rooted.changed
+        // A tree root was handed out, so the catalog has to say so in
+        // the SAME transaction as the rows that will be written into
+        // it: a crash between the two would leave rows in a page no
+        // table names, which is worse than the statement failing.
+        q = match store_schema(q, sqlengine.schema_of(engine))
+            Err(cause) =>
+                return Err(cause)
+            Ok(next)   => next
+    let run = match drive_rows(q, engine, st, 0)
+        Err(cause) =>
+            return Err(cause)
+        Ok(run)    => run
+    let done = match settle_statement(pager.stats(began), pager.stats(run.pager), run.pager)
+        Err(cause) =>
+            return Err(cause)
+        Ok(q)      => q
+    Ok(Executed { pager: done, schema: sqlengine.schema_of(run.engine), columns: run.columns,
+                  rows: run.rows, rows_affected: run.rows_affected })
 
 // Everything a finished statement produced.
 //
@@ -82,7 +517,20 @@ pub struct Executed
 // beside `execute`.
 pub fn next_row(p: pager.Pager, e: sqlengine.Engine,
                 st: sqlengine.Statement) -> Result<?RowStep, DriveError> [fs]
-    todo("pager-nv.driver.next_row")
+    // One row, then stop: the statement that comes back is the same
+    // statement, holding its position, so the caller's next call
+    // continues rather than starts again.
+    let run = match drive_rows(p, e, st, 1)
+        Err(cause) =>
+            return Err(cause)
+        Ok(run)    => run
+    if list.len(run.rows) > 0
+        Ok(Some(RowStep { pager: run.pager, engine: run.engine, statement: run.statement,
+                          row: list.get(run.rows, 0, []) }))
+    else if run.finished
+        Ok(None)
+    else
+        Err(Protocol(detail: "the statement stopped without a row and without finishing"))
 
 // One row and everything needed to ask for the next.
 //
@@ -102,7 +550,19 @@ pub struct RowStep
 // reimplementing the answering.
 pub fn step_once(p: pager.Pager, e: sqlengine.Engine,
                  st: sqlengine.Statement) -> Result<Stepped, DriveError> [fs]
-    todo("pager-nv.driver.step_once")
+    // A step is resumable: the request the engine could not finish
+    // with is still recorded in the engine, so the page it is waiting
+    // for is read here before the step that asked for it is repeated.
+    var state = DriverState { pager: p, engine: e }
+    let wanted = awaiting_page_of(e)
+    if wanted > 0
+        state = match feed_read(state.pager, state.engine, wanted)
+            Err(cause) =>
+                return Err(cause)
+            Ok(next)   => next
+    let adv = sqlengine.step(state.engine, st)
+    Ok(Stepped { pager: state.pager, engine: adv.engine, statement: adv.statement,
+                 result: adv.result })
 
 // One step: what came out, and everything that moved.
 pub struct Stepped
@@ -118,7 +578,11 @@ pub struct Stepped
 // driving a `btree.Cursor` directly — without the SQL layer — needs
 // exactly this and nothing else.
 pub fn answer(p: pager.Pager, request: btree.PageRequest) -> Result<Answered, DriveError> [fs]
-    todo("pager-nv.driver.answer")
+    match request
+        PrNeedPage(page_id)         => read_request(p, page_id)
+        PrWritePage(page_id, bytes) => write_request(p, page_id, bytes)
+        PrAllocPage(kind)           => alloc_request(p, kind)
+        PrFreePage(page_id)         => free_request(p, page_id)
 
 // What answering a request produced.
 //
@@ -137,7 +601,21 @@ pub struct Answered
 // here.  A `core` engine that read its own catalog would have `[fs]`
 // in its public row, and then nothing about the split would be true.
 pub fn load_schema(p: pager.Pager) -> Result<SchemaLoad, DriveError> [fs]
-    todo("pager-nv.driver.load_schema")
+    let root = pager.header(p).catalog_root
+    if root == 0
+        // A header that names no catalog is a database whose schema is
+        // empty, not one this build cannot read: the fields are all
+        // there, and the empty answer is what they say.
+        return Ok(SchemaLoad { pager: p, schema: sqlengine.schema_new() })
+    let read = match stored_read(pager.read_page(p, root))
+        Err(cause) =>
+            return Err(cause)
+        Ok(got)    => got
+    let schema = match schema_of_text(page_text(read.bytes))
+        Err(cause) =>
+            return Err(cause)
+        Ok(s)      => s
+    Ok(SchemaLoad { pager: read.pager, schema: schema })
 
 // The schema read off the file, and the pager that read it.
 pub struct SchemaLoad
@@ -150,7 +628,34 @@ pub struct SchemaLoad
 // crash between the data and the catalog cannot leave a table whose
 // rows exist and whose definition does not.
 pub fn store_schema(p: pager.Pager, s: sqlengine.Schema) -> Result<pager.Pager, DriveError> [fs]
-    todo("pager-nv.driver.store_schema")
+    // The catalog line format here records tables: a view, a trigger or
+    // an index would be written as nothing and read back as gone, which
+    // is worse than a caller being told to keep the SQL and replay it.
+    if list.len(s.views) > 0 or list.len(s.triggers) > 0 or list.len(s.indexes) > 0
+        return Err(Protocol(detail: "the catalog records tables; a view, a trigger or an index is not persisted yet"))
+    let root = pager.header(p).catalog_root
+    if root == 0
+        // The catalog page is reserved by `create`.  A file without one
+        // was written by something else, and there is no page number to
+        // write a schema to that the next `open` would look at.
+        return Err(Protocol(detail: "the file has no catalog page, so a schema has nowhere to go"))
+    let text = catalog_text(s)
+    let read = match stored_read(pager.read_page(p, root))
+        Err(cause) =>
+            return Err(cause)
+        Ok(got)    => got
+    if page_text(read.bytes) == text
+        // The page already says this.  Writing it again would spend a
+        // frame and a commit on a file that is already right, and it is
+        // what makes storing an unchanged schema outside a transaction
+        // cost nothing rather than fail.
+        return Ok(read.pager)
+    let size = pager.page_size(read.pager)
+    if str.len(text) > size - 1
+        // One page holds the whole catalog or nothing does: half of one
+        // is a database that reads back as a different database.
+        return Err(Protocol(detail: "the schema is larger than one catalog page"))
+    stored_pager(pager.write_page(read.pager, root, page_bytes(text, size)))
 
 // Run a whole script: several statements, one transaction.
 //
@@ -158,7 +663,59 @@ pub fn store_schema(p: pager.Pager, s: sqlengine.Schema) -> Result<pager.Pager, 
 // first statement that fails and rolls back, because a half-applied
 // migration is worse than none.
 pub fn execute_script(p: pager.Pager, sql: Str) -> Result<Executed, DriveError> [fs]
-    todo("pager-nv.driver.execute_script")
+    // One schema for the whole script, and one transaction: a migration
+    // whose second statement fails leaves the file the way it was, so
+    // the next run cannot find half of its work already done.
+    let loaded = match load_schema(p)
+        Err(cause) =>
+            return Err(cause)
+        Ok(got)    => got
+    let began = match stored_pager(pager.begin(loaded.pager))
+        Err(cause) =>
+            return Err(cause)
+        Ok(q)      => q
+    var state = DriverState { pager: began, engine: sqlengine.open(loaded.schema) }
+    var columns: [Str] = []
+    var rows: [[btcell.Cell]] = []
+    var affected = 0
+    for text in split_script(sql)
+        // A table a statement before this one created is still without
+        // a tree, and the host is what gives it one: the schema is
+        // rooted again and the engine opened on it before every
+        // statement, so a script that creates a table and then fills it
+        // never reaches for page zero.
+        let grown = match prepare_tables(state.pager, sqlengine.schema_of(state.engine))
+            Err(cause) =>
+                return failed_script(state.pager, cause)
+            Ok(got)    => got
+        let engine = sqlengine.open(grown.schema)
+        let st = match sqlengine.prepare(engine, text)
+            Err(cause) =>
+                return failed_script(grown.pager, Engine(cause: cause))
+            Ok(st)     => st
+        let run = match drive_rows(grown.pager, engine, st, 0)
+            Err(cause) =>
+                return failed_script(grown.pager, cause)
+            Ok(run)    => run
+        state = DriverState { pager: run.pager, engine: run.engine }
+        // A script answers with its LAST statement's rows: several
+        // result sets do not fit in one `Executed`, and the last one is
+        // the one a caller who ended a script with a SELECT asked for.
+        columns = run.columns[:]
+        rows = run.rows[:]
+        affected = run.rows_affected
+    let stored = match store_schema(state.pager, sqlengine.schema_of(state.engine))
+        Err(cause) =>
+            return failed_script(state.pager, cause)
+        Ok(q)      => q
+    // The catalog went in with the data, so the two cannot disagree
+    // about what the file holds.
+    let done = match stored_pager(pager.commit(stored))
+        Err(cause) =>
+            return failed_script(stored, cause)
+        Ok(q)      => q
+    Ok(Executed { pager: done, schema: sqlengine.schema_of(state.engine), columns: columns,
+                  rows: rows, rows_affected: affected })
 
 // Why a statement did not finish.
 //
@@ -182,4 +739,12 @@ pub enum DriveError
 // The human sentence behind each way a statement can fail to finish.
 impl Error for DriveError
     fn message(self) -> Str
-        todo("pager-nv.driver.DriveError.message")
+        match self
+            Engine(cause)    =>
+                "the engine refused the statement: ${cause.message()}"
+            Storage(cause)   =>
+                "the file could not be read or written: ${cause.message()}"
+            Protocol(detail) =>
+                "the driver and the engine disagree: ${detail}"
+            Stalled(steps)   =>
+                "the statement made no progress in ${str.from_int(steps)} steps"

@@ -46,8 +46,496 @@
 // between a library a reader can check and one they cannot.
 
 use std.list
+use std.fs
+use std.time
 use btree
 use pagefmt
+// The three shapes this module builds rather than only names: a struct
+// literal takes the imported name, not the qualified one.
+use pagefmt.{ Checksum, DbHeader, WalFrame, WalHeader }
+
+// ── the running state ────────────────────────────────────────────────
+
+// The log lives beside the database under its own name — SQLite's
+// `-wal` — so the two files are copied as the pair they are.
+fn wal_path(path: Str) -> Str
+    path + "-wal"
+
+// Big-endian, as the format is.  `pagefmt`'s copies of this pair are
+// private to it, and the free list is the only thing here that needs
+// one.
+fn be_u32(v: Int) -> [Int]
+    [(v >>> 24) & 255, (v >>> 16) & 255, (v >>> 8) & 255, v & 255]
+
+fn u32_at(bytes: [Int], at: Int) -> Int
+    let b0 = list.get(bytes, at, 0)
+    let b1 = list.get(bytes, at + 1, 0)
+    let b2 = list.get(bytes, at + 2, 0)
+    let b3 = list.get(bytes, at + 3, 0)
+    (b0 << 24) | (b1 << 16) | ((b2 << 8) | b3)
+
+// A power of two from 512 to 65536, which is the range this format
+// holds and what every offset here is computed on.
+fn page_size_ok(size: Int) -> Bool
+    size >= 512 and size <= 65536 and (size & (size - 1)) == 0
+
+// Salt 1 counts checkpoints and salt 2 spreads the count, so two
+// headers written a checkpoint apart cannot carry the same pair.
+// SQLite draws salt 2 at random; this package has no random source in
+// any of its rows, and what the format needs is that a frame from
+// before the last checkpoint is recognisable, which a salt that moves
+// every checkpoint gives it.
+fn salt1_for(seq: Int) -> Int
+    seq + 1
+
+fn salt2_for(seq: Int) -> Int
+    (salt1_for(seq) * 2654435761) & 4294967295
+
+// A log header that has not been written yet, or is about to be
+// rewritten.  Encoding it computes the two checksums over the first
+// twenty-four bytes and decoding reads them back, which is the round
+// trip `encode_wal_header` promises; its `Err` arm cannot happen and
+// answers the header the pager was going to write.
+fn fresh_wal_header(page_size: Int, seq: Int) -> pagefmt.WalHeader
+    let blank = WalHeader { version: 1, page_size: page_size, checkpoint_seq: seq,
+                                    salt1: salt1_for(seq), salt2: salt2_for(seq),
+                                    checksum1: 0, checksum2: 0 }
+    match pagefmt.decode_wal_header(pagefmt.encode_wal_header(blank))
+        Ok(filled) => filled
+        Err(_)     => blank
+
+// A page is exactly `page_size` bytes: a caller that hands back fewer
+// has the tail zeroed and one that hands back more is cut, because a
+// frame holding another length would move every offset after it.
+fn as_page(bytes: [Int], size: Int) -> [Int]
+    if list.len(bytes) == size
+        return list.clone(bytes)
+    var out = list.take(bytes, size)
+    while list.len(out) < size
+        out = list.push(out, 0)
+    out
+
+// The transaction in flight, if there is one.  The fields leave
+// nowhere else to record it: `pending`'s first element is a marker
+// whose page id is 0, which no page has.
+fn in_transaction(p: Pager) -> Bool
+    list.len(p.pending) > 0
+        and list.get(p.pending, 0, FrameRef { page_id: 0 - 1, frame: 0 }).page_id == 0
+
+// The index the next frame is written at.  Frames go in from zero in
+// order and a rollback hands the dead ones back to be overwritten, so
+// the count is the committed frames plus this transaction's own.
+fn next_frame(p: Pager) -> Int
+    if in_transaction(p)
+        list.len(p.committed) + (list.len(p.pending) - 1)
+    else
+        list.len(p.committed)
+
+// How many pages a pager holds before it drops the coldest.  64 pages
+// is 256 KB at the default page size: small enough for an embedder's
+// memory budget, large enough that a walk does not re-read its path.
+fn default_cache_limit() -> Int
+    64
+
+// The bytes of this page in the cache, if it is there.
+fn cached_page(cache: [CachedPage], page_id: Int) -> ?[Int]
+    var found: ?[Int] = None
+    for c in cache
+        if c.page_id == page_id
+            found = Some(c.bytes)
+    found
+
+// The cache without this page, which is what every write does to the
+// page it wrote: what is in there is the version before the write.
+fn cache_drop(cache: [CachedPage], page_id: Int) -> [CachedPage]
+    list.filter(cache, c => c.page_id != page_id)
+
+// The cache capped at `cap` pages, coldest first, which is the order
+// the list is kept in.
+fn cache_trim(cache: [CachedPage], cap: Int) -> [CachedPage]
+    var kept = list.clone(cache)
+    while list.len(kept) > cap
+        kept = list.skip(kept, 1)
+    kept
+
+// The cache with these bytes for this page, warmed to the newest end
+// of the order.
+fn cache_with(cache: [CachedPage], cap: Int, page_id: Int, bytes: [Int]) -> [CachedPage]
+    var kept = cache_drop(cache, page_id)
+    kept = list.push(kept, CachedPage { page_id: page_id, bytes: bytes })
+    cache_trim(kept, cap)
+
+// The pager with everything a write moves replaced.
+fn with_state(p: Pager, committed: [FrameRef], pending: [FrameRef], running: pagefmt.Checksum,
+              wal: pagefmt.WalHeader, header: pagefmt.DbHeader, cache: [CachedPage],
+              writes: Int) -> Pager
+    Pager { path: p.path, header: header, db_fd: p.db_fd, wal_fd: p.wal_fd,
+            committed: list.clone(committed), pending: list.clone(pending),
+            running: running, wal: wal, cache: list.clone(cache),
+            cache_limit: p.cache_limit, reads: p.reads, writes: writes, hits: p.hits }
+
+// The same header with the four numbers a caller changes replaced: an
+// allocation moves the page count, a free moves the two free-list
+// numbers, and a commit moves the change counter, and every one of them
+// needs the other fields carried over.
+fn with_header(h: pagefmt.DbHeader, page_count: Int, freelist_head: Int, freelist_count: Int,
+               change_counter: Int) -> pagefmt.DbHeader
+    DbHeader { version: h.version, page_size: h.page_size, page_count: page_count,
+                       freelist_head: freelist_head, freelist_count: freelist_count,
+                       change_counter: change_counter, schema_cookie: h.schema_cookie,
+                       catalog_root: h.catalog_root }
+
+// The pager with a different log, or with none: `open` and the first
+// write of a database that has no log yet are the two that move these.
+fn with_log(p: Pager, wal_fd: Int, wal: pagefmt.WalHeader, running: pagefmt.Checksum) -> Pager
+    Pager { path: p.path, header: p.header, db_fd: p.db_fd, wal_fd: wal_fd,
+            committed: list.clone(p.committed), pending: list.clone(p.pending),
+            running: running, wal: wal, cache: list.clone(p.cache),
+            cache_limit: p.cache_limit, reads: p.reads, writes: p.writes, hits: p.hits }
+
+// The pager a read leaves behind: a cache and two counters moved.
+fn with_reads(p: Pager, cache: [CachedPage], reads: Int, hits: Int) -> Pager
+    Pager { path: p.path, header: p.header, db_fd: p.db_fd, wal_fd: p.wal_fd,
+            committed: list.clone(p.committed), pending: list.clone(p.pending),
+            running: p.running, wal: p.wal, cache: list.clone(cache),
+            cache_limit: p.cache_limit, reads: reads, writes: p.writes, hits: hits }
+
+// The pager a new cache limit leaves behind: the limit is remembered
+// and the cache is trimmed down to it, which is the whole of the call.
+// Separated from `with_reads` because that one carries the old limit,
+// and a limit applied once and then forgotten is not a limit.
+fn with_limit(p: Pager, cap: Int) -> Pager
+    Pager { path: p.path, header: p.header, db_fd: p.db_fd, wal_fd: p.wal_fd,
+            committed: list.clone(p.committed), pending: list.clone(p.pending),
+            running: p.running, wal: p.wal, cache: cache_trim(p.cache, cap),
+            cache_limit: cap, reads: p.reads, writes: p.writes, hits: p.hits }
+
+// A pager that has just been created, or opened and recovered.
+fn born_pager(path: Str, header: pagefmt.DbHeader, db_fd: Int, wal_fd: Int, wal: pagefmt.WalHeader,
+              running: pagefmt.Checksum, committed: [FrameRef]) -> Pager
+    Pager { path: path, header: header, db_fd: db_fd, wal_fd: wal_fd,
+            committed: list.clone(committed), pending: [], running: running,
+            wal: wal, cache: [], cache_limit: default_cache_limit(),
+            reads: 0, writes: 0, hits: 0 }
+
+// A descriptor, or the operation that could not have one.
+fn open_read_or(path: Str, what: Str) -> Result<Int, PagerError> [fs]
+    match fs.open_read(path)
+        Some(fd) => Ok(fd)
+        None     => Err(IoFailed(operation: what, detail: path))
+
+fn open_write_or(path: Str, what: Str) -> Result<Int, PagerError> [fs]
+    match fs.open_write(path)
+        Some(fd) => Ok(fd)
+        None     => Err(IoFailed(operation: what, detail: path))
+
+// Both of these report the position, because a page that would not fit
+// is a different bug from a disk that would not answer.
+fn write_at_or(fd: Int, offset: Int, bytes: [Int], what: Str,
+               detail: Str) -> Result<Unit, PagerError> [fs]
+    match fs.write_at(fd, offset, bytes)
+        None         => Ok(())
+        Some(failed) => Err(IoFailed(operation: what, detail: failed))
+
+fn read_at_or(fd: Int, offset: Int, n: Int, page_id: Int,
+              path: Str) -> Result<[Int], PagerError> [fs]
+    match fs.read_at(fd, offset, n)
+        Some(bytes) => Ok(bytes)
+        None        =>
+            // How short the file was is what a caller needs to tell
+            // one page off the end from a file that lost its tail.
+            let size = fs.size(path) ?? 0
+            var got = size - offset
+            if got < 0
+                got = 0
+            Err(ShortRead(page_id: page_id, got: got, want: n))
+
+// The two pages a fresh database starts with, then the flush that
+// makes them durable: the header page, and the catalog page the
+// driver keeps its schema on.  Answers the failure rather than
+// returning it, so the caller closes the descriptor exactly once.
+fn write_new_db(fd: Int, first: [Int], catalog: [Int], page_size: Int,
+                path: Str) -> ?PagerError [fs]
+    match write_at_or(fd, 0, first, "write the first page", path)
+        Err(cause) => Some(cause)
+        Ok(_)      =>
+            match write_at_or(fd, page_size, catalog, "write the catalog page", path)
+                Err(cause) => Some(cause)
+                Ok(_)      =>
+                    if fs.fsync(fd)
+                        None
+                    else
+                        Some(IoFailed(operation: "flush the first page", detail: path))
+
+// The database header out of the file's first page, which is where a
+// database that has never been checkpointed keeps it.
+fn read_db_header(fd: Int, path: Str) -> Result<pagefmt.DbHeader, PagerError> [fs]
+    let raw = match read_at_or(fd, 0, pagefmt.db_header_size(), 1, path)
+        Err(cause) =>
+            return Err(cause)
+        Ok(bytes)  => bytes
+    match pagefmt.decode_db_header(raw)
+        Err(cause) => Err(BadFormat(cause: cause))
+        Ok(header) => Ok(header)
+
+// The log's own header, decoded and checked.
+fn read_wal_header(fd: Int, path: Str) -> Result<pagefmt.WalHeader, PagerError> [fs]
+    let raw = match read_at_or(fd, 0, pagefmt.wal_header_size(), 0, path)
+        Err(cause) =>
+            return Err(cause)
+        Ok(bytes)  => bytes
+    match pagefmt.decode_wal_header(raw)
+        Err(cause) => Err(BadFormat(cause: cause))
+        Ok(header) => Ok(header)
+
+// The newest frame in this list holding this page, or `None`.
+fn newest_frame(frames: [FrameRef], page_id: Int) -> ?FrameRef
+    var found: ?FrameRef = None
+    for f in frames
+        if f.page_id == page_id
+            found = Some(f)
+    found
+
+// The same, for a snapshot: only the first `limit` frames count, which
+// is what makes a commit that lands afterwards invisible to it.
+fn newest_frame_upto(frames: [FrameRef], page_id: Int, limit: Int) -> ?FrameRef
+    var found: ?FrameRef = None
+    var i = 0
+    for f in frames
+        if i < limit and f.page_id == page_id
+            found = Some(f)
+        i = i + 1
+    found
+
+// Which frame a read of this page consults: the transaction in flight
+// first, then the committed frames the snapshot can see.
+fn frame_of(p: Pager, page_id: Int, limit: Int) -> ?FrameRef
+    match newest_frame(p.pending, page_id)
+        Some(r) => Some(r)
+        None    => newest_frame_upto(p.committed, page_id, limit)
+
+// One page's bytes out of the log.
+fn frame_bytes(p: Pager, r: FrameRef) -> Result<[Int], PagerError> [fs]
+    let at = pagefmt.frame_offset(p.header.page_size, r.frame) + pagefmt.wal_frame_header_size()
+    read_at_or(p.wal_fd, at, p.header.page_size, r.page_id, wal_path(p.path))
+
+// One page's bytes out of the database file, which is where a page the
+// log does not hold still lives.
+fn file_bytes(p: Pager, page_id: Int) -> Result<[Int], PagerError> [fs]
+    let size = p.header.page_size
+    read_at_or(p.db_fd, (page_id - 1) * size, size, page_id, p.path)
+
+// The read path: the cache first, then the log's index up to `limit`
+// frames, then the file.  The frame index is searched backwards because
+// the newest frame holding a page is the one that counts.
+fn read_through(p: Pager, page_id: Int, limit: Int) -> Result<PageRead, PagerError> [fs]
+    if page_id < 1 or page_id > p.header.page_count
+        return Err(NoSuchPage(page_id: page_id, page_count: p.header.page_count))
+    // The cache is keyed by page id alone, so it can answer only when
+    // the caller's view is the newest one: a snapshot behind the log
+    // may be asking for a page as it was before a commit.
+    let newest = limit >= list.len(p.committed)
+    let cached = if newest
+        cached_page(p.cache, page_id)
+    else
+        None
+    match cached
+        Some(bytes) =>
+            let cache = cache_with(p.cache, p.cache_limit, page_id, bytes)
+            Ok(PageRead { pager: with_reads(p, cache, p.reads, p.hits + 1), bytes: bytes })
+        None        =>
+            let found = match frame_of(p, page_id, limit)
+                Some(r) => frame_bytes(p, r)
+                None    => file_bytes(p, page_id)
+            match found
+                Err(cause) => Err(cause)
+                Ok(page)   =>
+                    // A page read out of a view that is behind the log
+                    // is not put in the cache: it is not the page as it
+                    // stands.
+                    let cache = if newest
+                        cache_with(p.cache, p.cache_limit, page_id, page)
+                    else
+                        p.cache
+                    Ok(PageRead { pager: with_reads(p, cache, p.reads + 1, p.hits), bytes: page })
+
+// One frame onto the end of the log.  Nothing is flushed here: the
+// frames before a commit record are invisible until the commit frame
+// is on disk, and one flush of the log at the commit covers them all.
+fn append_frame(p: Pager, page_id: Int, bytes: [Int],
+                db_size_after: Int) -> Result<Pager, PagerError> [fs]
+    let page = as_page(bytes, p.header.page_size)
+    let n = next_frame(p)
+    let frame = WalFrame { page_id: page_id, db_size_after: db_size_after,
+                                   salt1: p.wal.salt1, salt2: p.wal.salt2,
+                                   checksum1: 0, checksum2: 0 }
+    let raw = pagefmt.encode_wal_frame(frame, page, p.running)
+    let fd = match open_write_or(wal_path(p.path), "open the log for writing")
+        Err(cause) =>
+            return Err(cause)
+        Ok(handle) => handle
+    match write_at_or(fd, pagefmt.frame_offset(p.header.page_size, n), raw,
+                      "write a log frame", p.path)
+        Err(cause) =>
+            fs.close(fd)
+            Err(cause)
+        Ok(_)      =>
+            fs.close(fd)
+            // The running checksum is the one this frame's own checksum
+            // was computed from with this frame folded in, which is what
+            // `encode_wal_frame` did on the way out.
+            let running = pagefmt.checksum(pagefmt.checksum(p.running, list.take(raw, 8)), page)
+            var pending = list.clone(p.pending)
+            pending = list.push(pending, FrameRef { page_id: page_id, frame: n })
+            let cache = cache_drop(p.cache, page_id)
+            Ok(with_state(p, p.committed, pending, running, p.wal, p.header, cache, p.writes + 1))
+
+// The log's header, written where a pager that has no log yet needs it.
+fn ensure_wal(p: Pager) -> Result<Pager, PagerError> [fs]
+    if p.wal_fd != 0
+        return Ok(p)
+    // The log is created at the first write rather than at `create`,
+    // so a database that has never been written to has no log at all.
+    let fresh = fresh_wal_header(p.header.page_size, p.wal.checkpoint_seq)
+    let fd = match open_write_or(wal_path(p.path), "create the log")
+        Err(cause) =>
+            return Err(cause)
+        Ok(handle) => handle
+    match write_at_or(fd, 0, pagefmt.encode_wal_header(fresh), "write the log header", p.path)
+        Err(cause) =>
+            fs.close(fd)
+            Err(cause)
+        Ok(_)      =>
+            if not fs.fsync(fd)
+                fs.close(fd)
+                return Err(IoFailed(operation: "flush the log header", detail: p.path))
+            fs.close(fd)
+            match open_read_or(wal_path(p.path), "open the log for reading")
+                Err(cause) => Err(cause)
+                Ok(rfd)    => Ok(with_log(p, rfd, fresh, pagefmt.checksum_seed(fresh)))
+
+// The two checksum words the last committed frame left the chain at,
+// which is where the next transaction's first frame continues from.
+fn checksum_after_commit(p: Pager) -> Result<pagefmt.Checksum, PagerError> [fs]
+    if list.len(p.committed) == 0
+        return Ok(pagefmt.checksum_seed(p.wal))
+    let last = list.get(p.committed, list.len(p.committed) - 1, FrameRef { page_id: 0, frame: 0 })
+    let at = pagefmt.frame_offset(p.header.page_size, last.frame) + 16
+    let raw = match fs.read_at(p.wal_fd, at, 8)
+        Some(bytes) => bytes
+        None        =>
+            return Err(ShortRead(page_id: last.page_id, got: 0, want: 8))
+    Ok(Checksum { s1: u32_at(raw, 0), s2: u32_at(raw, 4) })
+
+// Page 1 as the committed frames leave it, which is the header a
+// rollback goes back to: an allocation or a free moved the header with
+// the transaction, and none of that happened.
+fn committed_header(p: Pager) -> Result<pagefmt.DbHeader, PagerError> [fs]
+    let found = match newest_frame_upto(p.committed, 1, list.len(p.committed))
+        Some(r) => frame_bytes(p, r)
+        None    => read_at_or(p.db_fd, 0, pagefmt.db_header_size(), 1, p.path)
+    let raw = match found
+        Err(cause) =>
+            return Err(cause)
+        Ok(bytes)  => bytes
+    match pagefmt.decode_db_header(raw)
+        Err(cause) => Err(BadFormat(cause: cause))
+        Ok(header) => Ok(header)
+
+// Recovery: a forward scan of the log.  A frame whose checksum
+// continues the chain and whose salts are the header's is a frame the
+// log holds; the last one that carried a non-zero database size is
+// where its story ends, and anything after that was never committed.
+// A torn final frame fails one of the two tests and ends the scan,
+// which is the whole of crash recovery.
+//
+// Both files are named because the scan is over the log and the pager
+// it answers lives on the database: a pager carrying the log's path
+// would write its next frame to the log's own log.
+fn recover_log(db: Str, log_path: Str, fd: Int, wfd: Int, wal: pagefmt.WalHeader,
+               head: pagefmt.DbHeader) -> Result<Pager, PagerError> [fs]
+    let size = wal.page_size
+    let span = pagefmt.wal_frame_header_size() + size
+    let total = fs.size(log_path) ?? 0
+    var running = pagefmt.checksum_seed(wal)
+    var seen: [FrameRef] = []
+    var committed: [FrameRef] = []
+    var header = head
+    var last_header = head
+    var last_running = pagefmt.checksum_seed(wal)
+    var n = 0
+    var committed_count = 0
+    var more = true
+    while more
+        if pagefmt.frame_offset(size, n) + span > total
+            more = false
+        else
+            match fs.read_at(wfd, pagefmt.frame_offset(size, n), span)
+                None      =>
+                    more = false
+                Some(raw) =>
+                    let page = list.skip(raw, pagefmt.wal_frame_header_size())
+                    match pagefmt.decode_wal_frame(raw, page, running)
+                        Err(_) =>
+                            more = false
+                        Ok(f)  =>
+                            if not pagefmt.frame_is_current(f, wal)
+                                more = false
+                            else
+                                seen = list.push(seen, FrameRef { page_id: f.page_id, frame: n })
+                                running = Checksum { s1: f.checksum1, s2: f.checksum2 }
+                                if f.page_id == 1
+                                    match pagefmt.decode_db_header(page)
+                                        Ok(h)  =>
+                                            header = h
+                                        Err(_) => ()
+                                if f.db_size_after > 0
+                                    // The commit record: everything up
+                                    // to and including this frame is
+                                    // what the log holds, and the
+                                    // header it carried is the one the
+                                    // database is at.
+                                    committed_count = n + 1
+                                    last_header = header
+                                    last_running = running
+                                n = n + 1
+    // Copied once, here, rather than at every commit record.
+    committed = list.take(seen, committed_count)
+    Ok(born_pager(db, last_header, fd, wfd, wal, last_running, committed))
+
+// The half of `open` that runs once the database file is open: the
+// header, then the log if there is one.
+fn open_from(path: Str, fd: Int) -> Result<Pager, PagerError> [fs]
+    let head = match read_db_header(fd, path)
+        Err(cause) =>
+            return Err(cause)
+        Ok(header) => header
+    let log_path = wal_path(path)
+    if not fs.exists(log_path)
+        // No log: the database file is the whole story, and the header
+        // it carries is where the next log's chain would start.
+        let seed = fresh_wal_header(head.page_size, 0)
+        return Ok(born_pager(path, head, fd, 0, seed, pagefmt.checksum_seed(seed), []))
+    let wfd = match open_read_or(log_path, "open the log")
+        Err(cause) =>
+            return Err(cause)
+        Ok(handle) => handle
+    let wal = match read_wal_header(wfd, log_path)
+        Err(cause) =>
+            fs.close(wfd)
+            return Err(cause)
+        Ok(header) => header
+    // Two files that disagree about the page size are not a pair, and
+    // every offset in the log is computed on that number.
+    if wal.page_size != head.page_size
+        fs.close(wfd)
+        return Err(BadFormat(cause: pagefmt.PageSizeMismatch(db: head.page_size,
+                                                             wal: wal.page_size)))
+    match recover_log(path, log_path, fd, wfd, wal, head)
+        Err(cause) =>
+            fs.close(wfd)
+            Err(cause)
+        Ok(p)      => Ok(p)
 
 // An open database.
 //
@@ -105,12 +593,63 @@ pub struct Snapshot
 // therefore a frame that was never committed, and dropping it is the
 // whole of crash recovery.
 pub fn open(path: Str) -> Result<Pager, PagerError> [fs]
-    todo("pager-nv.pager.open")
+    if not fs.exists(path)
+        return Err(NotFound(path: path))
+    let fd = match open_read_or(path, "open the database")
+        Err(cause) =>
+            return Err(cause)
+        Ok(handle) => handle
+    // Everything opened after this descriptor is closed on the way out
+    // inside `open_from`, so a database that will not open leaves no
+    // descriptor behind.
+    match open_from(path, fd)
+        Err(cause) =>
+            fs.close(fd)
+            Err(cause)
+        Ok(p)      => Ok(p)
 
 // Create a database at this path, failing if something is already
 // there.
 pub fn create(path: Str, page_size: Int) -> Result<Pager, PagerError> [fs]
-    todo("pager-nv.pager.create")
+    if fs.exists(path)
+        return Err(Exists(path: path))
+    if not page_size_ok(page_size)
+        // A page size the format cannot hold is an input fault and goes
+        // in the error, the way a bad magic does.
+        return Err(BadFormat(cause: pagefmt.BadPageSize(got: page_size)))
+    let base = pagefmt.new_db_header(page_size)
+    // A fresh database is two pages: the header, and the catalog page
+    // the driver's schema lives on.  The catalog is reserved here
+    // because this is the only function that writes a header — a commit
+    // rewrites page 1 from the header in memory, so a page number the
+    // header does not carry cannot be added later.
+    let head = DbHeader { version: base.version, page_size: base.page_size, page_count: 2,
+                          freelist_head: 0, freelist_count: 0, change_counter: 0,
+                          schema_cookie: 0, catalog_root: 2 }
+    // Page 1 is a whole page of which the header is the first
+    // forty-eight bytes: a file that stopped at the header would answer
+    // a short read for the page everything else is found from.  The
+    // catalog page is written too, zeroed: a page nobody has written is
+    // a page a reader cannot tell from one that lost its bytes.
+    let first = as_page(pagefmt.encode_db_header(head), page_size)
+    let catalog = list.zeros(page_size)
+    let fd = match open_write_or(path, "create the database")
+        Err(cause) =>
+            return Err(cause)
+        Ok(handle) => handle
+    let bad = write_new_db(fd, first, catalog, page_size, path)
+    fs.close(fd)
+    match bad
+        Some(cause) => Err(cause)
+        None        =>
+            // The read descriptor is the one the pager keeps; a write
+            // opens its own for the length of the write, because there
+            // is no descriptor that both reads and writes.
+            match open_read_or(path, "open the database")
+                Err(cause) => Err(cause)
+                Ok(rfd)    =>
+                    let seed = fresh_wal_header(page_size, 0)
+                    Ok(born_pager(path, head, rfd, 0, seed, pagefmt.checksum_seed(seed), []))
 
 // Close both files.
 //
@@ -118,7 +657,11 @@ pub fn create(path: Str, page_size: Int) -> Result<Pager, PagerError> [fs]
 // checkpointing at close would turn a crash during close into a
 // half-checkpointed file for no benefit.
 pub fn close(p: Pager) -> Result<Unit, PagerError> [fs]
-    todo("pager-nv.pager.close")
+    if p.db_fd != 0
+        fs.close(p.db_fd)
+    if p.wal_fd != 0
+        fs.close(p.wal_fd)
+    Ok(())
 
 // The page under this id, as `page_size()` bytes.
 //
@@ -126,7 +669,7 @@ pub fn close(p: Pager) -> Result<Unit, PagerError> [fs]
 // moved.  See the module header for why that is threaded rather than
 // hidden behind a handle.
 pub fn read_page(p: Pager, page_id: Int) -> Result<PageRead, PagerError> [fs]
-    todo("pager-nv.pager.read_page")
+    read_through(p, page_id, list.len(p.committed))
 
 // A page, and the pager whose cache now holds it.
 pub struct PageRead
@@ -139,21 +682,64 @@ pub struct PageRead
 // makes a long-running read see a consistent database while writes
 // continue.
 pub fn read_page_at(p: Pager, snap: Snapshot, page_id: Int) -> Result<PageRead, PagerError> [fs]
-    todo("pager-nv.pager.read_page_at")
+    read_through(p, page_id, snap.frames)
 
 // Append this page to the WAL as an uncommitted frame.
 //
 // Nothing is visible to another reader until `commit`, and nothing
 // touches the database file until `checkpoint`.
 pub fn write_page(p: Pager, page_id: Int, bytes: [Int]) -> Result<Pager, PagerError> [fs]
-    todo("pager-nv.pager.write_page")
+    // The transaction is checked first: page 2 of a one-page database
+    // is the normal shape of a first write, and what the caller who
+    // forgot `begin` needs to hear is that, not a page count.
+    if not in_transaction(p)
+        return Err(NoTransaction(detail: "a write needs an open transaction; begin one first"))
+    if page_id < 1 or page_id > p.header.page_count
+        return Err(NoSuchPage(page_id: page_id, page_count: p.header.page_count))
+    let q = match ensure_wal(p)
+        Err(cause) =>
+            return Err(cause)
+        Ok(fresh)  => fresh
+    append_frame(q, page_id, bytes, 0)
 
 // Allocate a page: reuse the free list's head, or grow the file.
 //
 // Answers the id and the pager that now knows about it.  This is what
 // a `btree.PrAllocPage` is answered with.
 pub fn alloc_page(p: Pager, kind: Int) -> Result<PageAlloc, PagerError> [fs]
-    todo("pager-nv.pager.alloc_page")
+    // `kind` is the caller's hint about what the page will hold — the
+    // page kinds a `btree.PageRequest` names.  Nothing here writes page
+    // content, so the hint is not used: the caller fills the page in
+    // and hands it back through `write_page`.
+    let _ = kind
+    if p.header.freelist_head != 0
+        // The free list's head is a page whose first four bytes name
+        // the page that was the head before it, so reusing it is
+        // reading that pointer out and handing the page over.
+        let id = p.header.freelist_head
+        let read = match read_page(p, id)
+            Err(cause) =>
+                return Err(cause)
+            Ok(r)      => r
+        var count = p.header.freelist_count - 1
+        if count < 0
+            count = 0
+        let header = with_header(read.pager.header, read.pager.header.page_count,
+                                 u32_at(read.bytes, 0), count,
+                                 read.pager.header.change_counter)
+        return Ok(PageAlloc { pager: with_state(read.pager, read.pager.committed, read.pager.pending,
+                                                read.pager.running, read.pager.wal, header,
+                                                cache_drop(read.pager.cache, id), read.pager.writes),
+                              page_id: id })
+    // Nothing free: the database grows by one page, and the commit
+    // frame's `db_size_after` is what puts the new count on disk, so
+    // this needs no frame of its own.
+    let id = p.header.page_count + 1
+    let header = with_header(p.header, id, p.header.freelist_head, p.header.freelist_count,
+                             p.header.change_counter)
+    Ok(PageAlloc { pager: with_state(p, p.committed, p.pending, p.running, p.wal, header,
+                                     cache_drop(p.cache, id), p.writes),
+                   page_id: id })
 
 // A newly allocated page id, and the pager that allocated it.
 pub struct PageAlloc
@@ -161,21 +747,47 @@ pub struct PageAlloc
     page_id: Int
 
 // Put a page on the free list.
-//
-// Deferred while any snapshot is outstanding: a freed page whose id is
-// handed straight back to `alloc_page` would be overwritten under a
-// reader still holding it.  novodb has the same deferral and the same
-// reason, in `page.page_free_deferred`.
 pub fn free_page(p: Pager, page_id: Int) -> Result<Pager, PagerError> [fs]
-    todo("pager-nv.pager.free_page")
+    if page_id < 1
+        // Page 0 is the marker `pending` uses for an open transaction,
+        // so a free of it would be a free of the transaction itself.
+        return Err(NoSuchPage(page_id: page_id, page_count: p.header.page_count))
+    if not in_transaction(p)
+        return Err(NoTransaction(detail: "a free needs an open transaction; begin one first"))
+    // The freed page becomes the head of the free list, and its first
+    // four bytes name the page that was the head before it: the list is
+    // a chain through the pages themselves, so it costs no table of
+    // ids.  A page id past the end is accepted, because a tree that
+    // grew and shrank within one transaction frees a page the file has
+    // not written yet.
+    // The log is created here when it is not there yet, because the
+    // frame below is the first thing written to it and a frame without
+    // its header is a file recovery refuses.
+    let ready = match ensure_wal(p)
+        Err(cause) =>
+            return Err(cause)
+        Ok(fresh)  => fresh
+    let q = match append_frame(ready, page_id, be_u32(p.header.freelist_head), 0)
+        Err(cause) =>
+            return Err(cause)
+        Ok(next)   => next
+    let header = with_header(q.header, q.header.page_count, page_id,
+                             q.header.freelist_count + 1, q.header.change_counter)
+    Ok(with_state(q, q.committed, q.pending, q.running, q.wal, header,
+                  cache_drop(q.cache, page_id), q.writes))
 
 // Take a snapshot of the database as it is now.
 pub fn snapshot(p: Pager) -> Snapshot
-    todo("pager-nv.pager.snapshot")
+    Snapshot { frames: list.len(p.committed), change_counter: p.header.change_counter }
 
-// Release a snapshot, letting any deferred frees complete.
+// Release a snapshot.
 pub fn release(p: Pager, snap: Snapshot) -> Pager
-    todo("pager-nv.pager.release")
+    // There is nothing to complete.  A snapshot is a frame count and
+    // nothing is deferred for it, because a page freed and handed back
+    // out is written to the log and not over the copy a reader behind
+    // the log is still reading.
+    let _ = snap
+    p
 
 // Begin a write transaction.
 //
@@ -183,14 +795,59 @@ pub fn release(p: Pager, snap: Snapshot) -> Pager
 // caller bug and silently joining the outer transaction is how a
 // rollback loses somebody else's work.
 pub fn begin(p: Pager) -> Result<Pager, PagerError> [fs]
-    todo("pager-nv.pager.begin")
+    if in_transaction(p)
+        return Err(NoTransaction(detail: "a transaction is already open; a nested begin is a caller bug"))
+    // The marker's page id is 0, which no page has: `pending` is the
+    // only field that can say a transaction is open before it has
+    // written anything, and a transaction that has written nothing has
+    // no frames to point at.
+    let pending = [FrameRef { page_id: 0, frame: 0 }]
+    Ok(with_state(p, p.committed, pending, p.running, p.wal, p.header, p.cache, p.writes))
 
 // Commit: write the last frame with the new database size, and fsync.
 //
 // The non-zero `db_size_after` on that frame IS the commit record —
 // there is no separate one, which is what makes a commit one write.
 pub fn commit(p: Pager) -> Result<Pager, PagerError> [fs]
-    todo("pager-nv.pager.commit")
+    if not in_transaction(p)
+        return Err(NoTransaction(detail: "a commit needs an open transaction; begin one first"))
+    let q = match ensure_wal(p)
+        Err(cause) =>
+            return Err(cause)
+        Ok(fresh)  => fresh
+    // The commit frame carries page 1 as the commit leaves it, with the
+    // change counter moved, and its non-zero `db_size_after` is the
+    // commit record itself: there is no separate one, which is what
+    // makes a commit one write.
+    let header = with_header(q.header, q.header.page_count, q.header.freelist_head,
+                             q.header.freelist_count, q.header.change_counter + 1)
+    let first = as_page(pagefmt.encode_db_header(header), header.page_size)
+    let written = match append_frame(q, 1, first, header.page_count)
+        Err(cause) =>
+            return Err(cause)
+        Ok(next)   => next
+    // One flush of the log covers this frame and every frame the
+    // transaction wrote before it: they are all in the same file, and
+    // until it lands none of them is visible.
+    let fd = match open_write_or(wal_path(written.path), "open the log to flush it")
+        Err(cause) =>
+            return Err(cause)
+        Ok(handle) => handle
+    let flushed = fs.fsync(fd)
+    fs.close(fd)
+    if not flushed
+        return Err(IoFailed(operation: "flush the log at the commit", detail: written.path))
+    // The transaction's frames are the ones after the marker, and the
+    // commit frame is the last of them.  They leave the cache on the
+    // way in: what is in there is the version before the commit.
+    var committed = list.clone(written.committed)
+    var cache = list.clone(written.cache)
+    for f in written.pending
+        if f.page_id != 0
+            committed = list.push(committed, f)
+            cache = cache_drop(cache, f.page_id)
+    Ok(with_state(written, committed, [], written.running, written.wal, header, cache,
+                  written.writes))
 
 // Discard everything the open transaction wrote.
 //
@@ -198,17 +855,102 @@ pub fn commit(p: Pager) -> Result<Pager, PagerError> [fs]
 // pointed at them is dropped, so the next commit's checksum chain
 // simply does not include them.
 pub fn rollback(p: Pager) -> Result<Pager, PagerError> [fs]
-    todo("pager-nv.pager.rollback")
+    if not in_transaction(p)
+        return Err(NoTransaction(detail: "a rollback needs an open transaction; begin one first"))
+    // Where the next frame's chain starts.  Reading the two words back
+    // out of the last committed frame header says the same thing as
+    // folding every frame again, for one read instead of a scan.
+    let running = match checksum_after_commit(p)
+        Err(cause) =>
+            return Err(cause)
+        Ok(at)     => at
+    // The header moved with the transaction — an allocation, a free —
+    // so page 1 as the last commit wrote it is the header to go back
+    // to, and reading it back costs one read rather than a second copy
+    // of the header held in memory for the length of a transaction.
+    let header = match committed_header(p)
+        Err(cause) =>
+            return Err(cause)
+        Ok(back)   => back
+    var cache = list.clone(p.cache)
+    for f in p.pending
+        cache = cache_drop(cache, f.page_id)
+    Ok(with_state(p, p.committed, [], running, p.wal, header, cache, p.writes))
 
 // Copy every committed frame into the database file, fsync, and reset
 // the log.
 //
-// Blocks until no snapshot is outstanding, because a checkpoint
-// rewrites pages a reader may still be reading from the database file.
 // The salts change, which is what makes every frame already in the
 // file stale without truncating it.
 pub fn checkpoint(p: Pager) -> Result<Checkpointed, PagerError> [fs]
-    todo("pager-nv.pager.checkpoint")
+    if list.len(p.committed) == 0
+        // Nothing has been committed since the last checkpoint, so
+        // there is nothing to move and no reason to retire a log that
+        // holds no frames.
+        return Ok(Checkpointed { pager: p, pages_written: 0, frames_reclaimed: 0 })
+    if in_transaction(p)
+        // A transaction in flight has frames in the log this would
+        // retire, and their chain runs through a commit record the new
+        // header does not carry.
+        return Err(NoTransaction(detail: "a checkpoint needs the transaction to be over"))
+    // Each page the log holds, once: two frames of one page would be
+    // two writes of the same bytes to the same offset.
+    var ids: [Int] = []
+    var listed: HashMap<Int, Bool> = HashMap.new()
+    for f in p.committed
+        if HashMap.get(listed, f.page_id) == None
+            HashMap.set(listed, f.page_id, true)
+            ids = list.push(ids, f.page_id)
+    // The pages are all read before the database is opened for writing:
+    // a read that fails halfway through leaves the file as it was.
+    var pages: [[Int]] = []
+    var offsets: [Int] = []
+    for id in ids
+        let read = match read_page(p, id)
+            Err(cause) =>
+                return Err(cause)
+            Ok(r)      => r
+        pages = list.push(pages, read.bytes[:])
+        offsets = list.push(offsets, (id - 1) * p.header.page_size)
+    let fd = match open_write_or(p.path, "open the database for a checkpoint")
+        Err(cause) =>
+            return Err(cause)
+        Ok(handle) => handle
+    var i = 0
+    while i < list.len(ids)
+        match write_at_or(fd, offsets[i], pages[i], "write a page at the checkpoint", p.path)
+            Err(cause) =>
+                fs.close(fd)
+                return Err(cause)
+            Ok(_)      => ()
+        i = i + 1
+    // The database file has to be durable BEFORE the header that
+    // retires the frames is written: until it is, those frames are the
+    // only copy of what they hold.
+    if not fs.fsync(fd)
+        fs.close(fd)
+        return Err(IoFailed(operation: "flush the database at the checkpoint", detail: p.path))
+    fs.close(fd)
+    let fresh = fresh_wal_header(p.header.page_size, p.wal.checkpoint_seq + 1)
+    let wfd = match open_write_or(wal_path(p.path), "open the log for the checkpoint")
+        Err(cause) =>
+            return Err(cause)
+        Ok(handle) => handle
+    match write_at_or(wfd, 0, pagefmt.encode_wal_header(fresh), "rewrite the log header", p.path)
+        Err(cause) =>
+            fs.close(wfd)
+            return Err(cause)
+        Ok(_)      => ()
+    if not fs.fsync(wfd)
+        fs.close(wfd)
+        return Err(IoFailed(operation: "flush the log header", detail: p.path))
+    fs.close(wfd)
+    // The cache stays: every page in it is the page the database file
+    // now holds, so the bytes are the same bytes.
+    Ok(Checkpointed { pager: with_state(p, [], [], pagefmt.checksum_seed(fresh), fresh, p.header,
+                                        p.cache, p.writes + list.len(ids)),
+                      pages_written: list.len(ids),
+                      frames_reclaimed: list.len(p.committed) })
 
 // What a checkpoint moved.
 pub struct Checkpointed
@@ -218,15 +960,15 @@ pub struct Checkpointed
 
 // The database header as it stands.
 pub fn header(p: Pager) -> pagefmt.DbHeader
-    todo("pager-nv.pager.header")
+    p.header
 
 // The page size this file uses.
 pub fn page_size(p: Pager) -> Int
-    todo("pager-nv.pager.page_size")
+    p.header.page_size
 
 // How many pages the database holds.
 pub fn page_count(p: Pager) -> Int
-    todo("pager-nv.pager.page_count")
+    p.header.page_count
 
 // Reads, writes and cache hits since `open`.
 //
@@ -234,7 +976,11 @@ pub fn page_count(p: Pager) -> Int
 // wrong is the common performance bug, and a caller cannot see it
 // without these.
 pub fn stats(p: Pager) -> PagerStats
-    todo("pager-nv.pager.stats")
+    // `wal_frames` is the committed index and not the file's frame
+    // count: the frames a rollback dropped are still in the file, and
+    // what a caller can see is what this says.
+    PagerStats { reads: p.reads, writes: p.writes, cache_hits: p.hits,
+                 wal_frames: list.len(p.committed), cached_pages: list.len(p.cache) }
 
 // The counters `stats` answers.
 pub struct PagerStats
@@ -246,7 +992,16 @@ pub struct PagerStats
 
 // Set how many pages the cache holds, evicting down to it.
 pub fn set_cache_limit(p: Pager, pages: Int) -> Pager
-    todo("pager-nv.pager.set_cache_limit")
+    // A negative limit is a caller that meant zero, and a cache that
+    // answers a negative count would be a cache that evicts forever.
+    let cap = if pages < 0
+        0
+    else
+        pages
+    // The limit is remembered and not only applied: a limit that
+    // trimmed once and was forgotten would let the next read grow the
+    // cache back to the default.
+    with_limit(p, cap)
 
 // A frozen reading of the clock, for sql-engine-nv's `DATE('now')`
 // substitution.
@@ -258,7 +1013,11 @@ pub fn set_cache_limit(p: Pager, pages: Int) -> Pager
 // as an argument.  One `[time]` function here replaces a discharge
 // there, and the row is the disclosure.
 pub fn now_snapshot() -> NowStrings [time]
-    todo("pager-nv.pager.now_snapshot")
+    // One reading of the clock, three renderings of it, so the three
+    // strings describe one moment rather than three.
+    let t = time.now()
+    NowStrings { date: time.format(t, "%Y-%m-%d"), time_of_day: time.format(t, "%H:%M:%S"),
+                 datetime: time.to_string(t) }
 
 // The three strings the substitution needs.
 //
@@ -290,10 +1049,18 @@ pub enum PagerError
     ReadOnly(path: Str)
     // A write outside a transaction, or a nested `begin`.
     NoTransaction(detail: Str)
-    // A checkpoint was asked for while a snapshot was outstanding.
     SnapshotHeld(count: Int)
 
 // The human sentence behind each way the pager can fail.
 impl Error for PagerError
     fn message(self) -> Str
-        todo("pager-nv.pager.PagerError.message")
+        match self
+            NotFound(path)     => "there is no file at " + path
+            Exists(path)       => "something is already at " + path
+            BadFormat(cause)   => cause.message()
+            ShortRead(_, _, _) => "a read came back shorter than a page, so the file has lost its tail"
+            IoFailed(_, _)     => "the operating system refused a read or a write"
+            NoSuchPage(_, _)   => "that page id is past the end of the database"
+            ReadOnly(_)        => "the file is there and cannot be written to"
+            NoTransaction(_)   => "that call needs an open transaction and there is none"
+            SnapshotHeld(_)    => "a checkpoint will not run while a snapshot is outstanding"

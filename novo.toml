@@ -1,15 +1,12 @@
 [package]
 name        = "pager-nv"
-version     = "0.0.6"
+version     = "0.1.0"
 description = "The page file and its write-ahead log: an on-disk header, WAL frames with SQLite's rolling checksum, read and write of one page at a time, commit and checkpoint — and the driver loop that runs a sql-engine-nv statement to completion by answering everything it asks for."
 license     = "Apache-2.0"
 
-# An INTERFACE release: every `pub fn` body is a `todo()`, so the
-# signatures and the effect rows are published and nothing is
-# implemented.  `novo pkg publish` recognises the shape and requires
-# both the draft stability and the 0.0.x version; the first
-# implementation is the 0.1.0 published over it.
-stability   = "draft"
+# `experimental`: the bodies are written and the suites are green, but
+# the interface still moves in minor releases.
+stability   = "experimental"
 
 # `host`: this is the half that touches the machine.  Every function
 # that reaches the file says so in its row, and `[time]` is here
@@ -21,7 +18,7 @@ tags        = ["pager", "wal", "sqlite", "page-cache", "durability", "database",
 repository  = "https://github.com/novolang/pager-nv"
 bugs        = "https://github.com/novolang/pager-nv/issues"
 maintainers = ["novo-lang"]
-novo        = ">= 0.8.9"
+novo        = ">= 0.20.2"
 
 # A library: no `main`, so `novo pkg build` type-checks and
 # effect-checks every module under `src/` and writes no binary.
@@ -33,5 +30,11 @@ novo        = ">= 0.8.9"
 # Both `core`, so a `host` package may depend on them — the layer order
 # is linear and a dependency's layer may not be wider than its
 # consumer's.
+#
+# `sql-engine-nv` is wired by path while the two are developed together:
+# the registry's 0.0.6 is the interface release and every body in it is
+# a `todo()`, so `driver` cannot run against it.  Before this package is
+# published the line becomes the registry range `^0.1.0`, which is the
+# release that carries those bodies.
 btree-nv = "^0.1.0"
-sql-engine-nv = "^0.0.6"
+sql-engine-nv = { path = "../sql-engine-nv" }

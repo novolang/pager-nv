@@ -1,19 +1,23 @@
 // pager_tests.nv — the file, the log, and the snapshot.
 //
-// EVERY TEST HERE FAILS TODAY: pager-nv is published as its interface
-// and every body is `todo()`.  Each test below calls a `[fs]` function
-// and declares `[fs]` itself, which is the second thing this file is
-// for: the effect rows a real consumer will carry are written out
-// here, so a reviewer of the interface can see what depending on this
-// package costs before anybody depends on it.
+// Each test below calls a `[fs]` function and declares `[fs]` itself,
+// which is the second thing this file is for: the effect rows a real
+// consumer will carry are written out here, so a reviewer of the
+// interface can see what depending on this package costs before
+// anybody depends on it.
 
 use std.test
 use std.list
 use std.str
 use pager
 
-fn scratch(name: Str) -> Str
-    "/tmp/pager-nv-tests-" + name + ".db"
+// A path under /tmp with nothing at it: `pager.create` refuses a path
+// that is taken, so a file an earlier run left is removed first.
+fn scratch(name: Str) -> Str [fs]
+    let path = "/tmp/pager-nv-tests-" + name + ".db"
+    let _ = fs.delete(path)
+    let _ = fs.delete(path + "-wal")
+    path
 
 @test
 fn test_opening_a_file_that_is_not_there_says_which_one() [fs, io]

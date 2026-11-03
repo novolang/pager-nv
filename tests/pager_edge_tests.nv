@@ -1,0 +1,2306 @@
+// pager_edge_tests.nv — the paths the other two suites do not take.
+//
+// Every way a file can be wrong, recovery from a log left behind, a
+// checkpoint, a snapshot behind the log, and the catalog the driver
+// keeps on disk.  The bytes a test writes by hand are the format's
+// own — a header whose checksum is recomputed, a frame with one byte
+// moved — because a reader is only as good as the wrong files it
+// refuses.
+//
+// The files are under /tmp and every test erases what it made, so this
+// suite behaves the same on a machine where it has already run.
+
+use std.test
+use std.list
+use std.str
+use std.fs
+use btcell
+use pagefmt
+use pager
+use driver
+use sqlengine
+use btree
+// The shapes this file builds rather than only names, because the
+// grammar has no qualified struct literal.
+use pagefmt.{ Checksum, DbHeader, WalFrame, WalHeader }
+
+fn scratch(name: Str) -> Str
+    "/tmp/pager-nv-edge-" + name + ".db"
+
+fn log_of(db: Str) -> Str
+    db + "-wal"
+
+// The file this test wrote, gone, so the next run of the suite starts
+// where this one did.
+fn erase(name: Str) [fs]
+    let made = scratch(name)
+    let _ = fs.delete(made)
+    let _ = fs.delete(log_of(made))
+
+// A whole page: these bytes, then zeros.
+fn padded(bytes: [Int], size: Int) -> [Int]
+    var out = list.take(bytes, size)
+    while list.len(out) < size
+        out = list.push(out, 0)
+    out
+
+// The bytes of a text as a whole page, which is what a page a test
+// writes by hand is.
+fn text_bytes(text: Str, size: Int) -> [Int]
+    var out: [Int] = []
+    var i = 0
+    while i < str.len(text) and i < size
+        out = list.push(out, str.byte_at_or(text, i, 0))
+        i = i + 1
+    while list.len(out) < size
+        out = list.push(out, 0)
+    out
+
+// Four bytes big-endian, so a test can recompute a checksum it has
+// just invalidated.
+fn word_bytes(v: Int) -> [Int]
+    [(v >>> 24) & 255, (v >>> 16) & 255, (v >>> 8) & 255, v & 255]
+
+fn with_byte(bytes: [Int], at: Int, value: Int) -> [Int]
+    var out: [Int] = []
+    var i = 0
+    for b in bytes
+        out = list.push(out, (if i == at then value else b))
+        i = i + 1
+    out
+
+fn bumped_byte(bytes: [Int], at: Int) -> [Int]
+    with_byte(bytes, at, (list.get(bytes, at, 0) + 1) & 255)
+
+// A WAL header whose two checksum words match its first twenty-four
+// bytes again, so a test that moves a field reaches the checks the
+// checksum stands in front of.
+fn resealed(bytes: [Int]) -> [Int]
+    let c = pagefmt.checksum(Checksum { s1: 0, s2: 0 }, list.take(bytes, 24))
+    var out = list.take(bytes, 24)
+    out = list.append(out, word_bytes(c.s1))
+    list.append(out, word_bytes(c.s2))
+
+// Bytes on disk by hand.  A wrong file has to be WRITTEN wrong, and
+// `fs.write` takes a `Str`: a header is bytes, NULs and all.
+fn put_bytes(target: Str, bytes: [Int]) -> Bool [fs]
+    let _ = fs.delete(target)
+    let fd = match fs.open_write(target)
+        None    =>
+            return false
+        Some(f) => f
+    let bad = fs.write_at(fd, 0, bytes)
+    fs.close(fd)
+    match bad
+        None    => true
+        Some(_) => false
+
+// One byte of a file moved on by one, in place, which is the smallest
+// corruption a test can make and the one a torn write looks like.
+fn bump_file_byte(target: Str, at: Int) -> Bool [fs]
+    let fd = match fs.open_write(target)
+        None    =>
+            return false
+        Some(f) => f
+    let was = match fs.read_at(fd, at, 1)
+        None    => 0
+        Some(b) => list.get(b, 0, 0)
+    let bad = fs.write_at(fd, at, [(was + 1) & 255])
+    fs.close(fd)
+    match bad
+        None    => true
+        Some(_) => false
+
+// The catalog written down the way a caller who ran a DDL has to write
+// it: inside a transaction of its own, because a catalog line and the
+// pages it describes have to land together.
+fn save_schema(p: pager.Pager, s: sqlengine.Schema) -> Result<pager.Pager, driver.DriveError> [fs]
+    let open_tx = match pager.begin(p)
+        Err(cause) =>
+            return Err(Storage(cause: cause))
+        Ok(q)      => q
+    let written = match driver.store_schema(open_tx, s)
+        Err(cause) =>
+            return Err(cause)
+        Ok(q)      => q
+    match pager.commit(written)
+        Err(cause) => Err(Storage(cause: cause))
+        Ok(q)      => Ok(q)
+
+// A database with one table and one row in it: the smallest thing a
+// catalog can describe and a selection can come back from.
+//
+// The schema a DDL hands back is the caller's to write down, and it is
+// written without a root: the host allocates the tree the next time it
+// reads the schema back, which is the statement after it.
+fn with_a_row(name: Str) -> Result<pager.Pager, driver.DriveError> [fs]
+    erase(name)
+    let p = match pager.create(scratch(name), 4096)
+        Err(cause) =>
+            return Err(Storage(cause: cause))
+        Ok(fresh)  => fresh
+    let made = match driver.execute(p, "CREATE TABLE t (a INTEGER)", [])
+        Err(cause) =>
+            return Err(cause)
+        Ok(out)    => out
+    let saved = match save_schema(made.pager, made.schema)
+        Err(cause) =>
+            return Err(cause)
+        Ok(q)      => q
+    let filled = match driver.execute(saved, "INSERT INTO t VALUES (7)", [])
+        Err(cause) =>
+            return Err(cause)
+        Ok(out)    => out
+    Ok(filled.pager)
+
+// ── the format, as the bytes a wrong file has ────────────────────────
+
+@test
+fn test_every_way_a_header_can_be_wrong_has_a_sentence() [io]
+    test.assert_true(str.len(BadMagic(got: [1, 2, 3, 4]).message()) > 0, "the magic")
+    test.assert_true(str.len(BadVersion(got: 9, supported: 1).message()) > 0, "the version")
+    test.assert_true(str.len(TooShort(want: 48, have: 4).message()) > 0, "a short buffer")
+    test.assert_true(str.len(BadChecksum(page_id: 7).message()) > 0, "a checksum")
+    test.assert_true(str.len(BadPageSize(got: 3000).message()) > 0, "a page size")
+    test.assert_true(str.len(PageSizeMismatch(db: 4096, wal: 512).message()) > 0, "a pair of files")
+
+@test
+fn test_every_way_the_pager_can_fail_has_a_sentence() [io]
+    test.assert_true(str.len(NotFound(path: "/nope").message()) > 0, "a missing file")
+    test.assert_true(str.len(Exists(path: "/nope").message()) > 0, "a file that is there")
+    test.assert_true(str.len(BadFormat(cause: BadMagic(got: [1])).message()) > 0, "a bad format")
+    test.assert_true(str.len(ShortRead(page_id: 1, got: 0, want: 4096).message()) > 0, "a short read")
+    test.assert_true(str.len(IoFailed(operation: "read", detail: "/nope").message()) > 0, "the system")
+    test.assert_true(str.len(NoSuchPage(page_id: 9, page_count: 2).message()) > 0, "a page id")
+    test.assert_true(str.len(ReadOnly(path: "/nope").message()) > 0, "a file opened for reading")
+    test.assert_true(str.len(NoTransaction(detail: "none open").message()) > 0, "a transaction")
+    test.assert_true(str.len(SnapshotHeld(count: 1).message()) > 0, "a snapshot")
+
+@test
+fn test_a_database_header_that_is_not_one_is_refused() [io]
+    let good = pagefmt.encode_db_header(pagefmt.new_db_header(4096))
+    test.assert_eq(list.len(good), 48)
+    match pagefmt.decode_db_header(list.take(good, 2))
+        Ok(_)  =>
+            return test.fail("two bytes are not a header")
+        Err(e) =>
+            match e
+                TooShort(_, _) => test.assert_true(true, "short is what two bytes are")
+                _              =>
+                    return test.fail("that is what TooShort is for")
+    // Long enough for the magic, still not long enough for the header.
+    match pagefmt.decode_db_header(list.take(good, 20))
+        Ok(_)  =>
+            return test.fail("twenty bytes are not a header")
+        Err(e) =>
+            match e
+                TooShort(_, _) => test.assert_true(true, "the magic is there and the rest is not")
+                _              =>
+                    return test.fail("that is what TooShort is for")
+    // Each field the reader checks, reached because it is the one that
+    // is wrong.
+    match pagefmt.decode_db_header(with_byte(good, 0, 88))
+        Ok(_)  =>
+            return test.fail("a database does not start with that")
+        Err(e) =>
+            match e
+                BadMagic(_) => test.assert_true(true, "the magic is what is wrong")
+                _           =>
+                    return test.fail("that is what BadMagic is for")
+    match pagefmt.decode_db_header(with_byte(good, 4, 9))
+        Ok(_)  =>
+            return test.fail("version 9 is not this format")
+        Err(e) =>
+            match e
+                BadVersion(_, _) => test.assert_true(true, "the version is what is wrong")
+                _                =>
+                    return test.fail("that is what BadVersion is for")
+    match pagefmt.decode_db_header(with_byte(good, 11, 3))
+        Ok(_)  =>
+            return test.fail("4099 bytes is not a page size")
+        Err(e) =>
+            match e
+                BadPageSize(_) => test.assert_true(true, "the page size is what is wrong")
+                _              =>
+                    return test.fail("that is what BadPageSize is for")
+
+@test
+fn test_a_log_header_that_is_not_one_is_refused() [io]
+    let good = pagefmt.encode_wal_header(WalHeader { version: 1, page_size: 4096, checkpoint_seq: 0,
+                                                     salt1: 7, salt2: 9, checksum1: 0, checksum2: 0 })
+    match pagefmt.decode_wal_header(list.take(good, 2))
+        Ok(_)  =>
+            return test.fail("two bytes are not a header")
+        Err(e) =>
+            match e
+                TooShort(_, _) => test.assert_true(true, "short is what two bytes are")
+                _              =>
+                    return test.fail("that is what TooShort is for")
+    match pagefmt.decode_wal_header(list.take(good, 6))
+        Ok(_)  =>
+            return test.fail("six bytes are not a header")
+        Err(e) =>
+            match e
+                TooShort(_, _) => test.assert_true(true, "the magic is there and the rest is not")
+                _              =>
+                    return test.fail("that is what TooShort is for")
+    match pagefmt.decode_wal_header(with_byte(good, 0, 88))
+        Ok(_)  =>
+            return test.fail("a log does not start with that")
+        Err(e) =>
+            match e
+                BadMagic(_) => test.assert_true(true, "the magic is what is wrong")
+                _           =>
+                    return test.fail("that is what BadMagic is for")
+    match pagefmt.decode_wal_header(bumped_byte(good, 24))
+        Ok(_)  =>
+            return test.fail("a checksum word moved by one is not a checksum")
+        Err(e) =>
+            match e
+                BadChecksum(_) => test.assert_true(true, "the checksum is what is wrong")
+                _              =>
+                    return test.fail("that is what BadChecksum is for")
+    // The checksum is checked before the fields it covers, so a test
+    // that moves one of them puts the pair back first.
+    match pagefmt.decode_wal_header(resealed(with_byte(good, 4, 9)))
+        Ok(_)  =>
+            return test.fail("version 9 is not this format")
+        Err(e) =>
+            match e
+                BadVersion(_, _) => test.assert_true(true, "the version is what is wrong")
+                _                =>
+                    return test.fail("that is what BadVersion is for")
+    match pagefmt.decode_wal_header(resealed(with_byte(good, 11, 3)))
+        Ok(_)  =>
+            return test.fail("4099 bytes is not a page size")
+        Err(e) =>
+            match e
+                BadPageSize(_) => test.assert_true(true, "the page size is what is wrong")
+                _              =>
+                    return test.fail("that is what BadPageSize is for")
+
+@test
+fn test_a_frame_is_read_against_the_checksum_before_it() [io]
+    let wal = WalHeader { version: 1, page_size: 4096, checkpoint_seq: 0, salt1: 7, salt2: 9,
+                          checksum1: 0, checksum2: 0 }
+    let seed = pagefmt.checksum_seed(wal)
+    let page = list.zeros(4096)
+    let raw = pagefmt.encode_wal_frame(WalFrame { page_id: 3, db_size_after: 9, salt1: wal.salt1,
+                                                  salt2: wal.salt2, checksum1: 0, checksum2: 0 },
+                                       page, seed)
+    var frame = WalFrame { page_id: 0, db_size_after: 0, salt1: 0, salt2: 0,
+                           checksum1: 0, checksum2: 0 }
+    match pagefmt.decode_wal_frame(raw, page, seed)
+        Ok(back) =>
+            frame = back
+        Err(e)   =>
+            return test.fail(e.message())
+    test.assert_eq(frame.page_id, 3)
+    test.assert_eq(frame.db_size_after, 9)
+    test.assert_true(pagefmt.frame_is_current(frame, wal), "the salts are the header's")
+    let other = WalHeader { version: 1, page_size: 4096, checkpoint_seq: 1, salt1: 8, salt2: 9,
+                            checksum1: 0, checksum2: 0 }
+    test.assert_true(not pagefmt.frame_is_current(frame, other), "another checkpoint's frame is not")
+    match pagefmt.decode_wal_frame(list.take(raw, 4), page, seed)
+        Ok(_)  =>
+            return test.fail("four bytes are not a frame header")
+        Err(e) =>
+            match e
+                TooShort(_, _) => test.assert_true(true, "short is what four bytes are")
+                _              =>
+                    return test.fail("that is what TooShort is for")
+    // The same frame against a chain that did not lead to it: the
+    // rolling pair is what makes a frame lifted out of another log
+    // detectable, so a frame is read against the bytes before it and
+    // not against itself.
+    let elsewhere = pagefmt.checksum(seed, word_bytes(4294967295))
+    match pagefmt.decode_wal_frame(raw, page, elsewhere)
+        Ok(_)  =>
+            return test.fail("this frame was not written against that chain")
+        Err(e) =>
+            match e
+                BadChecksum(_) => test.assert_true(true, "the checksum is what is wrong")
+                _              =>
+                    return test.fail("that is what BadChecksum is for")
+
+// ── the pager's refusals ─────────────────────────────────────────────
+
+@test
+fn test_the_transaction_rules_are_values_and_not_panics() [fs, io]
+    erase("rules")
+    let p = match pager.create(scratch("rules"), 4096)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(p)  => p
+    match pager.write_page(p, 2, [])
+        Ok(_)  =>
+            return test.fail("a write needs a transaction")
+        Err(e) =>
+            match e
+                NoTransaction(_) => test.assert_true(true, "that is what NoTransaction is for")
+                _                =>
+                    return test.fail("the transaction is what is missing")
+    match pager.free_page(p, 2)
+        Ok(_)  =>
+            return test.fail("a free needs a transaction")
+        Err(e) =>
+            match e
+                NoTransaction(_) => test.assert_true(true, "a free is a write")
+                _                =>
+                    return test.fail("the transaction is what is missing")
+    match pager.commit(p)
+        Ok(_)  =>
+            return test.fail("there is nothing to commit")
+        Err(e) =>
+            match e
+                NoTransaction(_) => test.assert_true(true, "a commit ends a transaction")
+                _                =>
+                    return test.fail("the transaction is what is missing")
+    match pager.rollback(p)
+        Ok(_)  =>
+            return test.fail("there is nothing to roll back")
+        Err(e) =>
+            match e
+                NoTransaction(_) => test.assert_true(true, "a rollback ends a transaction")
+                _                =>
+                    return test.fail("the transaction is what is missing")
+    let open_tx = match pager.begin(p)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    match pager.begin(open_tx)
+        Ok(_)  =>
+            return test.fail("a nested begin is a caller bug")
+        Err(e) =>
+            match e
+                NoTransaction(_) => test.assert_true(true, "and it is reported as one")
+                _                =>
+                    return test.fail("that is what NoTransaction is for")
+    // A pager with nothing committed has nothing to retire, and the
+    // quiet answer comes before the transaction check: an empty log is
+    // not an error, not even under a transaction.  The refusal needs a
+    // frame behind it, and the end of this test is where one is.
+    match pager.checkpoint(open_tx)
+        Ok(got) =>
+            test.assert_eq(got.pages_written, 0)
+            test.assert_eq(got.frames_reclaimed, 0)
+        Err(e)  =>
+            return test.fail("nothing committed is not a failure: " + e.message())
+    match pager.write_page(open_tx, 999999, [])
+        Ok(_)  =>
+            return test.fail("there is no page 999999")
+        Err(e) =>
+            match e
+                NoSuchPage(id, count) =>
+                    test.assert_eq(id, 999999)
+                    test.assert_true(count > 0, "and it says how many there are")
+                _                     =>
+                    return test.fail("that is what NoSuchPage is for")
+    // A free of a page past the end is accepted rather than refused: a
+    // tree that grew and shrank inside one transaction frees a page the
+    // file has not written yet, and its id is an id all the same.
+    match pager.free_page(open_tx, 999999)
+        Ok(q)  =>
+            test.assert_eq(pager.header(q).freelist_head, 999999)
+            test.assert_eq(pager.header(q).freelist_count, 1)
+        Err(e) =>
+            return test.fail("a free past the end is not an error: " + e.message())
+    match pager.free_page(open_tx, 0)
+        Ok(_)  =>
+            return test.fail("page zero is not a page")
+        Err(e) =>
+            match e
+                NoSuchPage(_, _) => test.assert_true(true, "ids start at one")
+                _                =>
+                    return test.fail("that is what NoSuchPage is for")
+    // With a frame committed there is something to retire, and the
+    // transaction under it is what the refusal is about.
+    let written = match pager.write_page(open_tx, 2, [7])
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    let committed = match pager.commit(written)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    let again = match pager.begin(committed)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    match pager.checkpoint(again)
+        Ok(_)  =>
+            return test.fail("a checkpoint under a transaction would retire its frames")
+        Err(e) =>
+            match e
+                NoTransaction(_) => test.assert_true(true, "the transaction has to be over")
+                _                =>
+                    return test.fail("that is what NoTransaction is for")
+    erase("rules")
+
+@test
+fn test_a_file_the_pager_cannot_open_is_refused_by_name() [fs, io]
+    erase("absent")
+    match pager.open(scratch("absent"))
+        Ok(_)  =>
+            return test.fail("that file does not exist")
+        Err(e) =>
+            match e
+                NotFound(_) => test.assert_true(true, "and the error says so")
+                _           =>
+                    return test.fail("that is what NotFound is for")
+    // A directory is a path that exists and is not a database.
+    match pager.open("/tmp")
+        Ok(_)  =>
+            return test.fail("/tmp is not a database")
+        Err(e) => test.assert_true(str.len(e.message()) > 0, "the open failed and said why")
+    match pager.create(scratch("absent") + "-nowhere/x.db", 4096)
+        Ok(_)  =>
+            return test.fail("there is no directory to create that in")
+        Err(e) =>
+            match e
+                IoFailed(_, _) => test.assert_true(true, "the system refused the create")
+                _              =>
+                    return test.fail("that is what IoFailed is for")
+    // A page size the format cannot hold is an input fault, and an
+    // input fault is a value.
+    match pager.create(scratch("absent"), 1000)
+        Ok(_)  =>
+            return test.fail("1000 is not a power of two")
+        Err(e) =>
+            match e
+                BadFormat(_) => test.assert_true(true, "the page size is what is wrong")
+                _            =>
+                    return test.fail("that is what BadFormat is for")
+    // Something is already there.
+    let db = scratch("absent")
+    let _ = pager.create(db, 4096)
+    match pager.create(db, 4096)
+        Ok(_)  =>
+            return test.fail("create does not replace what is there")
+        Err(e) =>
+            match e
+                Exists(_) => test.assert_true(true, "and the error says so")
+                _         =>
+                    return test.fail("that is what Exists is for")
+    erase("absent")
+    // A file that is not this format at all: the magic is what is
+    // wrong, and it is wrong before anything else is read.
+    let junk = scratch("junk")
+    test.assert_true(put_bytes(junk, padded(word_bytes(1), 64)), "the junk file is written")
+    match pager.open(junk)
+        Ok(_)  =>
+            return test.fail("sixty-four bytes of nonsense is not a database")
+        Err(e) =>
+            match e
+                BadFormat(cause) =>
+                    match cause
+                        BadMagic(_) => test.assert_true(true, "the four bytes are what is wrong")
+                        _           =>
+                            return test.fail("that is what BadMagic is for")
+                _                =>
+                    return test.fail("that is what BadFormat is for")
+    let _ = fs.delete(junk)
+
+@test
+fn test_a_page_that_was_allocated_and_never_written_reads_short() [fs, io]
+    // The count moved and the file did not, so the page the header
+    // names is a page the file does not hold.  That is a short read and
+    // not a missing page: the caller's id is right and the file's tail
+    // is not.
+    erase("grow")
+    let p = match pager.create(scratch("grow"), 4096)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(p)  => p
+    let open_tx = match pager.begin(p)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    let got = match pager.alloc_page(open_tx, 6)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(a)  => a
+    test.assert_eq(pager.page_count(got.pager), 3)
+    match pager.read_page(got.pager, got.page_id)
+        Ok(_)  =>
+            return test.fail("nothing has been written to it")
+        Err(e) =>
+            match e
+                ShortRead(_, _, _) => test.assert_true(true, "the file is short of the page")
+                _                  =>
+                    return test.fail("that is what ShortRead is for")
+    erase("grow")
+
+@test
+fn test_the_free_list_head_comes_back_on_the_next_allocation() [fs, io]
+    erase("free-list")
+    let p = match pager.create(scratch("free-list"), 4096)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(p)  => p
+    let open_tx = match pager.begin(p)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    let first = match pager.alloc_page(open_tx, 6)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(a)  => a
+    let freed = match pager.free_page(first.pager, first.page_id)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    test.assert_eq(pager.header(freed).freelist_head, first.page_id)
+    test.assert_eq(pager.header(freed).freelist_count, 1)
+    // The freed page's first four bytes name the page that was the head
+    // before it — zero — so the next allocation reads zero out and
+    // hands the page over rather than growing the file.
+    let again = match pager.alloc_page(freed, 6)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(a)  => a
+    test.assert_eq(again.page_id, first.page_id)
+    test.assert_eq(pager.page_count(again.pager), 3)
+    test.assert_eq(pager.header(again.pager).freelist_head, 0)
+    test.assert_eq(pager.header(again.pager).freelist_count, 0)
+    erase("free-list")
+
+@test
+fn test_the_cache_answers_twice_and_is_trimmed_to_its_limit() [fs, io]
+    erase("cache")
+    let p = match pager.create(scratch("cache"), 4096)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(p)  => p
+    let one = match pager.read_page(p, 1)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(r)  => r
+    test.assert_eq(pager.stats(one.pager).cache_hits, 0)
+    let two = match pager.read_page(one.pager, 1)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(r)  => r
+    test.assert_eq(pager.stats(two.pager).cache_hits, 1)
+    // One page of cache and two pages read: the coldest goes.
+    let small = pager.set_cache_limit(two.pager, 1)
+    let three = match pager.read_page(small, 1)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(r)  => r
+    let four = match pager.read_page(three.pager, 2)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(r)  => r
+    test.assert_eq(pager.stats(four.pager).cached_pages, 1)
+    test.assert_eq(pager.stats(four.pager).cache_hits, 2)
+    test.assert_eq(pager.stats(four.pager).reads, 2)
+    // A negative limit is a caller that meant zero.
+    test.assert_eq(pager.stats(pager.set_cache_limit(four.pager, -1)).cached_pages, 0)
+    erase("cache")
+
+@test
+fn test_the_clock_is_read_once_and_rendered_three_ways() [time, io]
+    // The one `[time]` function in this package, and the reason the row
+    // is in it: a `core` engine may not read the clock, so the read
+    // happens here and the engine takes the strings.
+    let now = pager.now_snapshot()
+    test.assert_true(str.len(now.date) > 0, "a date")
+    test.assert_true(str.len(now.time_of_day) > 0, "a time of day")
+    test.assert_true(str.len(now.datetime) > 0, "a datetime")
+
+// ── the log, and what survives a close ───────────────────────────────
+
+@test
+fn test_a_rolled_back_transaction_leaves_the_checksum_where_the_commit_did() [fs, io]
+    // The running checksum is a chain, and a rollback that left it
+    // anywhere else would make the next transaction's frames fail
+    // verification the moment anything read them again.
+    erase("rollback")
+    let p = match pager.create(scratch("rollback"), 4096)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(p)  => p
+    let open_tx = match pager.begin(p)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    let written = match pager.write_page(open_tx, 2, padded([1, 2, 3], 4096))
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    let committed = match pager.commit(written)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    test.assert_eq(pager.snapshot(committed).frames, 2)
+    let again = match pager.begin(committed)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    let dead = match pager.write_page(again, 2, padded([9, 9, 9], 4096))
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    let back = match pager.rollback(dead)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    test.assert_eq(pager.snapshot(back).frames, 2)
+    // The next transaction overwrites the frame the rollback left
+    // behind, continuing from the checksum the commit ended at.
+    let third = match pager.begin(back)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    let rewritten = match pager.write_page(third, 2, padded([4, 5, 6], 4096))
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    let done = match pager.commit(rewritten)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    test.assert_eq(pager.snapshot(done).frames, 4)
+    match pager.close(done)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(_)  => test.assert_true(true, "both files are closed")
+    // Opening it again scans the log from the front and has to agree
+    // with every checksum in it.
+    let reopened = match pager.open(scratch("rollback"))
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    test.assert_eq(pager.snapshot(reopened).frames, 4)
+    test.assert_eq(pager.header(reopened).change_counter, 2)
+    let page = match pager.read_page(reopened, 2)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(r)  => r
+    test.assert_eq(list.get(page.bytes, 0, 0), 4)
+    test.assert_eq(list.get(page.bytes, 1, 0), 5)
+    let _ = pager.close(page.pager)
+    erase("rollback")
+
+@test
+fn test_a_checkpoint_moves_the_frames_into_the_file() [fs, io]
+    erase("checkpoint")
+    let p = match pager.create(scratch("checkpoint"), 4096)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(p)  => p
+    let open_tx = match pager.begin(p)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    let written = match pager.write_page(open_tx, 2, padded([7, 7], 4096))
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    let committed = match pager.commit(written)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    test.assert_eq(pager.stats(committed).wal_frames, 2)
+    let done = match pager.checkpoint(committed)
+        Err(e)    =>
+            return test.fail(e.message())
+        Ok(moved) => moved
+    test.assert_eq(done.pages_written, 2)
+    test.assert_eq(done.frames_reclaimed, 2)
+    test.assert_eq(pager.stats(done.pager).wal_frames, 0)
+    // Nothing committed and nothing to move: a checkpoint of a quiet
+    // database is not an error.
+    match pager.checkpoint(done.pager)
+        Err(e)    =>
+            return test.fail(e.message())
+        Ok(quiet) =>
+            test.assert_eq(quiet.pages_written, 0)
+            test.assert_eq(quiet.frames_reclaimed, 0)
+    let page = match pager.read_page(done.pager, 2)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(r)  => r
+    test.assert_eq(list.get(page.bytes, 0, 0), 7)
+    let _ = pager.close(page.pager)
+    // The frames are in the database file now, so a fresh open finds
+    // the page with no log to read.
+    let reopened = match pager.open(scratch("checkpoint"))
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    test.assert_eq(pager.stats(reopened).wal_frames, 0)
+    let again = match pager.read_page(reopened, 2)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(r)  => r
+    test.assert_eq(list.get(again.bytes, 0, 0), 7)
+    let _ = pager.close(again.pager)
+    erase("checkpoint")
+
+@test
+fn test_a_log_left_behind_is_read_at_the_next_open() [fs, io]
+    // A close does not checkpoint, so the committed pages are only in
+    // the log, and the next open is the recovery a crash would need.
+    erase("recover")
+    let p = match pager.create(scratch("recover"), 4096)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(p)  => p
+    let open_tx = match pager.begin(p)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    let written = match pager.write_page(open_tx, 2, padded([11, 12], 4096))
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    let committed = match pager.commit(written)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    let _ = pager.close(committed)
+    let reopened = match pager.open(scratch("recover"))
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    test.assert_eq(pager.snapshot(reopened).frames, 2)
+    test.assert_eq(pager.header(reopened).change_counter, 1)
+    let page = match pager.read_page(reopened, 2)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(r)  => r
+    test.assert_eq(list.get(page.bytes, 0, 0), 11)
+    let _ = pager.close(page.pager)
+    erase("recover")
+
+@test
+fn test_a_frame_from_before_the_last_checkpoint_is_not_read() [fs, io]
+    // The log is written in place and never truncated, so a checkpoint
+    // leaves the old frames behind with the old salts — and a scan that
+    // did not stop at them would read a database that no longer exists.
+    erase("stale")
+    let p = match pager.create(scratch("stale"), 4096)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(p)  => p
+    let open_tx = match pager.begin(p)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    let written = match pager.write_page(open_tx, 2, padded([21], 4096))
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    let committed = match pager.commit(written)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    let done = match pager.checkpoint(committed)
+        Err(e)    =>
+            return test.fail(e.message())
+        Ok(moved) => moved
+    let _ = pager.close(done.pager)
+    // A second transaction after the checkpoint: its frames carry the
+    // new salts, and the old ones are still the first thing in the
+    // file.
+    let reopened = match pager.open(scratch("stale"))
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    test.assert_eq(pager.snapshot(reopened).frames, 0)
+    let second = match pager.begin(reopened)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    let again = match pager.write_page(second, 2, padded([22], 4096))
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    let both = match pager.commit(again)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    let _ = pager.close(both)
+    let third = match pager.open(scratch("stale"))
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    test.assert_eq(pager.snapshot(third).frames, 2)
+    let page = match pager.read_page(third, 2)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(r)  => r
+    test.assert_eq(list.get(page.bytes, 0, 0), 22)
+    let _ = pager.close(page.pager)
+    erase("stale")
+
+@test
+fn test_a_torn_frame_ends_the_scan() [fs, io]
+    // A frame whose bytes no longer verify is where recovery stops, so
+    // the database reads as of its last checkpoint: the frame after it
+    // was the commit, and it is not read at all.
+    erase("torn")
+    let p = match pager.create(scratch("torn"), 4096)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(p)  => p
+    let open_tx = match pager.begin(p)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    let written = match pager.write_page(open_tx, 2, padded([31], 4096))
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    let committed = match pager.commit(written)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    let _ = pager.close(committed)
+    // The first frame's stored checksum, one byte of it moved.
+    let at = pagefmt.wal_header_size() + 16
+    test.assert_true(bump_file_byte(log_of(scratch("torn")), at), "the log is there to be moved")
+    let reopened = match pager.open(scratch("torn"))
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    test.assert_eq(pager.stats(reopened).wal_frames, 0)
+    let page = match pager.read_page(reopened, 2)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(r)  => r
+    test.assert_eq(list.get(page.bytes, 0, 0), 0)
+    let _ = pager.close(page.pager)
+    erase("torn")
+
+@test
+fn test_a_frame_whose_salts_are_not_the_header_s_ends_the_scan() [fs, io]
+    // The commit frame's salt, moved.  The salts are not part of the
+    // frame's checksum — they say WHICH run of the log the frame
+    // belongs to — so this frame verifies and is still not read.
+    erase("salt")
+    let p = match pager.create(scratch("salt"), 4096)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(p)  => p
+    let open_tx = match pager.begin(p)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    let written = match pager.write_page(open_tx, 2, padded([32], 4096))
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    let committed = match pager.commit(written)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    let _ = pager.close(committed)
+    // Frame one is the commit: its salt 1 is at the frame's eighth byte.
+    let at = pagefmt.frame_offset(4096, 1) + 8
+    test.assert_true(bump_file_byte(log_of(scratch("salt")), at), "the log is there to be moved")
+    let reopened = match pager.open(scratch("salt"))
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    test.assert_eq(pager.stats(reopened).wal_frames, 0)
+    let page = match pager.read_page(reopened, 2)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(r)  => r
+    test.assert_eq(list.get(page.bytes, 0, 0), 0)
+    let _ = pager.close(page.pager)
+    erase("salt")
+
+@test
+fn test_a_snapshot_behind_the_log_reads_the_page_as_it_was() [fs, io]
+    // A snapshot is a frame count, and that is the whole of the
+    // isolation: a commit that lands afterwards is not consulted, and
+    // the cache is not asked either, because what is in there is the
+    // newer page.
+    erase("snapshot")
+    let p = match pager.create(scratch("snapshot"), 4096)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(p)  => p
+    let open_tx = match pager.begin(p)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    let written = match pager.write_page(open_tx, 2, padded([1], 4096))
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    let committed = match pager.commit(written)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    let snap = pager.snapshot(committed)
+    let again = match pager.begin(committed)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    let second = match pager.write_page(again, 2, padded([2], 4096))
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    let both = match pager.commit(second)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    let now = match pager.read_page(both, 2)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(r)  => r
+    test.assert_eq(list.get(now.bytes, 0, 0), 2)
+    let old = match pager.read_page_at(now.pager, snap, 2)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(r)  => r
+    test.assert_eq(list.get(old.bytes, 0, 0), 1)
+    let released = pager.release(old.pager, snap)
+    test.assert_eq(pager.snapshot(released).frames, 4)
+    erase("snapshot")
+
+@test
+fn test_a_log_whose_page_size_differs_is_not_its_pair() [fs, io]
+    erase("mismatch")
+    let p = match pager.create(scratch("mismatch"), 4096)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(p)  => p
+    let _ = pager.close(p)
+    let wrong = pagefmt.encode_wal_header(WalHeader { version: 1, page_size: 512, checkpoint_seq: 0,
+                                                      salt1: 3, salt2: 4, checksum1: 0, checksum2: 0 })
+    test.assert_true(put_bytes(log_of(scratch("mismatch")), wrong), "the wrong log is written")
+    match pager.open(scratch("mismatch"))
+        Ok(_)  =>
+            return test.fail("two files of different page sizes are not one database")
+        Err(e) =>
+            match e
+                BadFormat(cause) =>
+                    match cause
+                        PageSizeMismatch(_, _) => test.assert_true(true, "the pair is what is wrong")
+                        _                      =>
+                            return test.fail("that is what PageSizeMismatch is for")
+                _                =>
+                    return test.fail("the format is what is wrong")
+    erase("mismatch")
+
+@test
+fn test_a_log_that_cannot_be_read_is_not_ignored() [fs, io]
+    // A directory where the log should be.  It exists, so the open
+    // tries to read it, and a log that cannot be read is not a log the
+    // pager may quietly do without.
+    erase("log-dir")
+    let p = match pager.create(scratch("log-dir"), 4096)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(p)  => p
+    let _ = pager.close(p)
+    test.assert_true(fs.mkdir(log_of(scratch("log-dir"))), "a directory takes the log's place")
+    match pager.open(scratch("log-dir"))
+        Ok(_)  =>
+            return test.fail("a log that cannot be read is not a log")
+        Err(e) => test.assert_true(str.len(e.message()) > 0, "the open failed and said why")
+    let _ = fs.delete(log_of(scratch("log-dir")))
+    erase("log-dir")
+
+@test
+fn test_a_log_that_cannot_be_created_is_a_storage_error() [fs, io]
+    // The log is created at the first write.  With a directory in its
+    // place there is no log, and a write that cannot put a frame
+    // anywhere is a storage error and not a lost frame.
+    erase("log-new")
+    let p = match pager.create(scratch("log-new"), 4096)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(p)  => p
+    let open_tx = match pager.begin(p)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    test.assert_true(fs.mkdir(log_of(scratch("log-new"))), "a directory takes the log's place")
+    match pager.write_page(open_tx, 2, padded([41], 4096))
+        Ok(_)  =>
+            return test.fail("a log that cannot be created is not a log")
+        Err(e) =>
+            match e
+                IoFailed(_, _) => test.assert_true(true, "the system refused the create")
+                _              =>
+                    return test.fail("that is what IoFailed is for")
+    let _ = fs.delete(log_of(scratch("log-new")))
+    erase("log-new")
+
+@test
+fn test_a_frame_that_cannot_be_written_is_a_storage_error() [fs, io]
+    // A pager that already has a log opens it again for every frame, so
+    // the same directory is reached from the other side: the log exists
+    // and this frame cannot go into it.
+    erase("log-open")
+    let p = match pager.create(scratch("log-open"), 4096)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(p)  => p
+    let open_tx = match pager.begin(p)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    let first = match pager.write_page(open_tx, 2, padded([42], 4096))
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    let log_path = log_of(scratch("log-open"))
+    test.assert_true(fs.delete(log_path), "the log is removed")
+    test.assert_true(fs.mkdir(log_path), "a directory takes its place")
+    match pager.write_page(first, 2, padded([43], 4096))
+        Ok(_)  =>
+            return test.fail("a log that cannot be opened is not a log")
+        Err(e) =>
+            match e
+                IoFailed(_, _) => test.assert_true(true, "the system refused the open")
+                _              =>
+                    return test.fail("that is what IoFailed is for")
+    let _ = fs.delete(log_path)
+    erase("log-open")
+
+@test
+fn test_a_checkpoint_that_cannot_write_the_database_is_a_storage_error() [fs, io]
+    // The pages the log holds are read first — they are all in the log
+    // — and then the database is opened for writing, which is where
+    // this fails.  Nothing has been written anywhere at that point.
+    erase("ck-fail")
+    let p = match pager.create(scratch("ck-fail"), 4096)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(p)  => p
+    let open_tx = match pager.begin(p)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    let written = match pager.write_page(open_tx, 2, padded([44], 4096))
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    let committed = match pager.commit(written)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    test.assert_true(fs.delete(scratch("ck-fail")), "the database is removed")
+    test.assert_true(fs.mkdir(scratch("ck-fail")), "a directory takes its place")
+    match pager.checkpoint(committed)
+        Ok(_)  =>
+            return test.fail("the pages have nowhere to go")
+        Err(e) =>
+            match e
+                IoFailed(_, _) => test.assert_true(true, "the system refused the open")
+                _              =>
+                    return test.fail("that is what IoFailed is for")
+    let _ = fs.delete(scratch("ck-fail"))
+    erase("ck-fail")
+
+@test
+fn test_a_write_the_system_refuses_is_a_storage_error() [fs, io]
+    // The log is a link to the device that refuses every write, so the
+    // open succeeds and the frame comes back refused: it is not on
+    // disk, and the caller hears that rather than a commit that never
+    // happened.
+    if fs.exists("/dev/full")
+        erase("full")
+        let p = match pager.create(scratch("full"), 4096)
+            Err(e) =>
+                return test.fail(e.message())
+            Ok(p)  => p
+        let open_tx = match pager.begin(p)
+            Err(e) =>
+                return test.fail(e.message())
+            Ok(q)  => q
+        let first = match pager.write_page(open_tx, 2, padded([51], 4096))
+            Err(e) =>
+                return test.fail(e.message())
+            Ok(q)  => q
+        let log_path = log_of(scratch("full"))
+        test.assert_true(fs.delete(log_path), "the log is removed")
+        test.assert_true(fs.symlink("/dev/full", log_path), "the log becomes the full device")
+        match pager.write_page(first, 2, padded([52], 4096))
+            Ok(_)  =>
+                return test.fail("the device refuses writes")
+            Err(e) =>
+                match e
+                    IoFailed(_, _) => test.assert_true(true, "the system refused the write")
+                    _              =>
+                        return test.fail("that is what IoFailed is for")
+        let _ = fs.delete(log_path)
+        erase("full")
+    else
+        test.assert_true(true, "this machine has no /dev/full to refuse a write")
+
+// ── the driver's catalog, and the rows it describes ──────────────────
+
+@test
+fn test_a_row_survives_a_write_and_a_reopen() [fs, io]
+    match with_a_row("row")
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(p)  =>
+            let _ = pager.close(p)
+            let reopened = match pager.open(scratch("row"))
+                Err(e) =>
+                    return test.fail(e.message())
+                Ok(q)  => q
+            let loaded = match driver.load_schema(reopened)
+                Err(e)  =>
+                    return test.fail(e.message())
+                Ok(got) => got
+            test.assert_eq(list.len(loaded.schema.tables), 1)
+            match driver.execute(loaded.pager, "SELECT a FROM t", [])
+                Err(e)  =>
+                    return test.fail(e.message())
+                Ok(out) =>
+                    test.assert_eq(list.len(out.rows), 1)
+                    test.assert_eq(out.columns, ["a"])
+                    test.assert_eq(out.rows_affected, 1)
+            let _ = pager.close(loaded.pager)
+    erase("row")
+
+@test
+fn test_a_catalog_line_this_build_cannot_read_is_refused() [fs, io]
+    // A catalog page is this package's own page.  A line in it that
+    // this build cannot read is a protocol error and not a caller's
+    // mistake, so it is refused with the line rather than skipped.
+    erase("bad-catalog")
+    let p = match pager.create(scratch("bad-catalog"), 4096)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(p)  => p
+    let open_tx = match pager.begin(p)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    let root = pager.header(open_tx).catalog_root
+    test.assert_true(root > 0, "a file this pager wrote has a catalog page")
+    let written = match pager.write_page(open_tx, root, text_bytes("nonsense is what this is", 4096))
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    let committed = match pager.commit(written)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    match driver.load_schema(committed)
+        Ok(_)  =>
+            return test.fail("that line is not a catalog line")
+        Err(e) =>
+            match e
+                Protocol(_) => test.assert_true(true, "the driver's own page is what is wrong")
+                _           =>
+                    return test.fail("that is what Protocol is for")
+    let _ = pager.close(committed)
+    // A line that names a table and then does not say what the table
+    // is: the parser is what refuses this one.
+    erase("bad-stmt")
+    let p2 = match pager.create(scratch("bad-stmt"), 4096)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(p2) => p2
+    let tx2 = match pager.begin(p2)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    let root2 = pager.header(tx2).catalog_root
+    let written2 = match pager.write_page(tx2, root2, text_bytes("table 3 1 0 CREATE TABLE", 4096))
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    let committed2 = match pager.commit(written2)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    match driver.load_schema(committed2)
+        Ok(_)  =>
+            return test.fail("that statement is not a CREATE TABLE")
+        Err(e) =>
+            match e
+                Protocol(_) => test.assert_true(true, "the statement is what is wrong")
+                _           =>
+                    return test.fail("that is what Protocol is for")
+    let _ = pager.close(committed2)
+    erase("bad-catalog")
+    erase("bad-stmt")
+
+@test
+fn test_a_schema_with_a_view_is_refused_by_the_catalog_writer() [fs, io]
+    // A catalog line that named a view would be read back as a table or
+    // as nothing at all, so the writer refuses while the caller can
+    // still keep the SQL and replay it.
+    erase("view")
+    let p = match pager.create(scratch("view"), 4096)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(p)  => p
+    let made = match driver.execute(p, "CREATE TABLE t (a INTEGER)", [])
+        Err(e)  =>
+            return test.fail(e.message())
+        Ok(out) => out
+    let viewed = match driver.execute(made.pager, "CREATE VIEW v AS SELECT a FROM t", [])
+        Err(e)  =>
+            return test.fail(e.message())
+        Ok(out) => out
+    test.assert_eq(list.len(viewed.schema.views), 1)
+    let open_tx = match pager.begin(viewed.pager)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    match driver.store_schema(open_tx, viewed.schema)
+        Ok(_)  =>
+            return test.fail("a view is not a catalog line this build writes")
+        Err(e) =>
+            match e
+                Protocol(_) => test.assert_true(true, "the catalog is what cannot hold it")
+                _           =>
+                    return test.fail("that is what Protocol is for")
+    let _ = pager.close(viewed.pager)
+    erase("view")
+
+@test
+fn test_a_schema_larger_than_a_page_is_refused() [fs, io]
+    // One page holds the whole catalog or nothing does: half of one is
+    // a database that reads back as a different database.
+    erase("wide")
+    let p = match pager.create(scratch("wide"), 4096)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(p)  => p
+    var names: [Str] = []
+    var i = 0
+    while i < 400
+        names = list.push(names, "c" + str.from_int(i) + " INTEGER")
+        i = i + 1
+    let wide = "CREATE TABLE w (" + str.join(names, ", ") + ")"
+    // The statement itself is not the refusal: a table definition is
+    // kept in memory until the caller writes it down, so the page is
+    // what refuses it — and it refuses before anything is on the log.
+    let made = match driver.execute(p, wide, [])
+        Err(e)  =>
+            return test.fail(e.message())
+        Ok(out) => out
+    test.assert_eq(list.len(made.schema.tables), 1)
+    match save_schema(made.pager, made.schema)
+        Ok(_)  =>
+            return test.fail("that schema does not fit in one page")
+        Err(e) =>
+            match e
+                Protocol(_) => test.assert_true(true, "the catalog page is what cannot hold it")
+                _           =>
+                    return test.fail("that is what Protocol is for")
+    let _ = pager.close(made.pager)
+    erase("wide")
+
+@test
+fn test_a_file_with_no_catalog_page_has_nowhere_to_put_one() [fs, io]
+    // A header this package would not write: no catalog root.  Reading
+    // its schema is an empty schema, and writing one is a refusal
+    // rather than a page number nothing will look at.
+    let db = scratch("no-catalog")
+    let header = pagefmt.encode_db_header(DbHeader { version: 1, page_size: 4096, page_count: 1,
+                                                     freelist_head: 0, freelist_count: 0,
+                                                     change_counter: 0, schema_cookie: 0,
+                                                     catalog_root: 0 })
+    test.assert_true(put_bytes(db, padded(header, 4096)), "the file is written")
+    let p = match pager.open(db)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    let loaded = match driver.load_schema(p)
+        Err(e)  =>
+            return test.fail(e.message())
+        Ok(got) => got
+    test.assert_eq(list.len(loaded.schema.tables), 0)
+    match driver.store_schema(loaded.pager, sqlengine.schema_new())
+        Ok(_)  =>
+            return test.fail("there is no catalog page to write")
+        Err(e) =>
+            match e
+                Protocol(_) => test.assert_true(true, "nowhere to put it")
+                _           =>
+                    return test.fail("that is what Protocol is for")
+    let _ = pager.close(loaded.pager)
+    let _ = fs.delete(db)
+    // A header that names a page the file does not hold: the catalog is
+    // there and cannot be read, which is the pager's error and not an
+    // empty schema.
+    let other = scratch("bad-root")
+    let header2 = pagefmt.encode_db_header(DbHeader { version: 1, page_size: 4096, page_count: 2,
+                                                      freelist_head: 0, freelist_count: 0,
+                                                      change_counter: 0, schema_cookie: 0,
+                                                      catalog_root: 9 })
+    test.assert_true(put_bytes(other, padded(header2, 4096)), "the second file is written")
+    let p2 = match pager.open(other)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    match driver.load_schema(p2)
+        Ok(_)  =>
+            return test.fail("there is no page 9")
+        Err(e) =>
+            match e
+                Storage(_) => test.assert_true(true, "the pager refused the read")
+                _          =>
+                    return test.fail("that is what Storage is for")
+    let _ = pager.close(p2)
+    let _ = fs.delete(other)
+
+@test
+fn test_parameters_are_refused_rather_than_ignored() [fs, io]
+    erase("params")
+    let p = match pager.create(scratch("params"), 4096)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(p)  => p
+    match driver.execute(p, "SELECT 1", [btcell.of_int(1)])
+        Ok(_)  =>
+            return test.fail("this build binds nothing, so it must not pretend to")
+        Err(e) =>
+            match e
+                Protocol(_) => test.assert_true(true, "the driver is what refuses")
+                _           =>
+                    return test.fail("that is what Protocol is for")
+    let _ = pager.close(p)
+    erase("params")
+
+@test
+fn test_answering_a_request_supplies_the_thing_the_request_names() [fs, io]
+    erase("answer")
+    let p = match pager.create(scratch("answer"), 4096)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(p)  => p
+    // A read: the page bytes come back, and the id does not, because
+    // the caller asked with one.
+    let read = match driver.answer(p, PrNeedPage(1))
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(a)  => a
+    test.assert_eq(list.len(read.page), 4096)
+    test.assert_eq(read.page_id, 0)
+    match driver.answer(p, PrNeedPage(999999))
+        Ok(_)  =>
+            return test.fail("there is no page 999999")
+        Err(e) =>
+            match e
+                Storage(_) => test.assert_true(true, "the pager refused the read")
+                _          =>
+                    return test.fail("that is what Storage is for")
+    // An allocation: an id comes back and no page does.  The kind is
+    // btree-nv's hint and the pager does not use it.
+    let alloc = match driver.answer(p, PrAllocPage(6))
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(a)  => a
+    test.assert_eq(alloc.page_id, 3)
+    test.assert_eq(list.len(alloc.page), 0)
+    // The two that are writes, outside a transaction: each one is the
+    // pager's refusal and not the driver's.
+    match driver.answer(p, PrWritePage(2, padded([1], 4096)))
+        Ok(_)  =>
+            return test.fail("a write needs a transaction")
+        Err(e) =>
+            match e
+                Storage(_) => test.assert_true(true, "the pager refused the write")
+                _          =>
+                    return test.fail("that is what Storage is for")
+    match driver.answer(p, PrFreePage(1))
+        Ok(_)  =>
+            return test.fail("a free needs a transaction")
+        Err(e) =>
+            match e
+                Storage(_) => test.assert_true(true, "the pager refused the free")
+                _          =>
+                    return test.fail("that is what Storage is for")
+    let _ = pager.close(p)
+    erase("answer")
+
+@test
+fn test_next_row_walks_a_statement_one_row_at_a_time() [fs, io]
+    match with_a_row("next-row")
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(p)  =>
+            let loaded = match driver.load_schema(p)
+                Err(e)  =>
+                    return test.fail(e.message())
+                Ok(got) => got
+            let engine = sqlengine.open(loaded.schema)
+            let st = match sqlengine.prepare(engine, "SELECT a FROM t")
+                Err(e) =>
+                    return test.fail(e.message())
+                Ok(st) => st
+            let first = match driver.next_row(loaded.pager, engine, st)
+                Err(e)  =>
+                    return test.fail(e.message())
+                Ok(got) => got
+            match first
+                Some(step) =>
+                    test.assert_eq(list.len(step.row), 1)
+                    // The same statement, still standing where it was:
+                    // the second call finishes it and answers no row.
+                    match driver.next_row(step.pager, step.engine, step.statement)
+                        Err(e)   =>
+                            return test.fail(e.message())
+                        Ok(none) =>
+                            match none
+                                None    => test.assert_true(true, "one row in the table, none left")
+                                Some(_) =>
+                                    return test.fail("there is no second row")
+                None       =>
+                    return test.fail("the table has a row in it")
+            let _ = pager.close(p)
+    erase("next-row")
+
+@test
+fn test_step_once_answers_the_page_it_asked_for() [fs, io]
+    // The engine records the page it is waiting for, so a host that
+    // takes the request away and comes back is answered from that
+    // record rather than from a queue of its own.
+    match with_a_row("step-once")
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(p)  =>
+            let loaded = match driver.load_schema(p)
+                Err(e)  =>
+                    return test.fail(e.message())
+                Ok(got) => got
+            let engine = sqlengine.open(loaded.schema)
+            let st = match sqlengine.prepare(engine, "SELECT a FROM t WHERE a = 7")
+                Err(e) =>
+                    return test.fail(e.message())
+                Ok(st) => st
+            let first = match driver.step_once(loaded.pager, engine, st)
+                Err(e) =>
+                    return test.fail(e.message())
+                Ok(s)  => s
+            match first.result
+                SrPage(PrNeedPage(page_id)) =>
+                    test.assert_true(page_id > 0, "a tree asks for a page of its own")
+                _                           =>
+                    test.assert_true(true, "this statement needs no page from the host")
+            // Stepping again feeds the page the engine is waiting for
+            // and goes on, so the caller owns the loop and not the
+            // protocol.
+            var state = first
+            var done = false
+            var steps = 0
+            while not done and steps < 64
+                steps = steps + 1
+                let next = match driver.step_once(state.pager, state.engine, state.statement)
+                    Err(e) =>
+                        return test.fail(e.message())
+                    Ok(s)  => s
+                state = next
+                match next.result
+                    SrDone(_)  =>
+                        done = true
+                    SrError(e) =>
+                        return test.fail(e.message())
+                    _          => test.assert_true(true, "another step")
+            test.assert_true(done, "the statement finishes well inside the budget")
+            let _ = pager.close(state.pager)
+    erase("step-once")
+
+@test
+fn test_a_script_commits_the_rows_it_wrote() [fs, io]
+    // Several statements, one transaction, and the schema stored with
+    // them: the last statement's rows are what a script answers with.
+    erase("script")
+    let p = match pager.create(scratch("script"), 4096)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(p)  => p
+    let out = match driver.execute_script(p, "CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (5); SELECT a FROM t;")
+        Err(e)  =>
+            return test.fail(e.message())
+        Ok(out) => out
+    test.assert_eq(list.len(out.schema.tables), 1)
+    test.assert_eq(list.len(out.rows), 1)
+    test.assert_eq(out.columns, ["a"])
+    test.assert_eq(out.rows_affected, 1)
+    // A statement with no `;` after it is still a statement.
+    let one = match driver.execute_script(out.pager, "SELECT a FROM t")
+        Err(e)   =>
+            return test.fail(e.message())
+        Ok(done) => done
+    test.assert_eq(list.len(one.rows), 1)
+    let _ = pager.close(one.pager)
+    // And the rows are on disk, so the next open reads them back.
+    let reopened = match pager.open(scratch("script"))
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    let loaded = match driver.load_schema(reopened)
+        Err(e)  =>
+            return test.fail(e.message())
+        Ok(got) => got
+    match driver.execute(loaded.pager, "SELECT a FROM t", [])
+        Err(e)  =>
+            return test.fail(e.message())
+        Ok(out) =>
+            test.assert_eq(list.len(out.rows), 1)
+            test.assert_eq(out.rows_affected, 1)
+    let _ = pager.close(loaded.pager)
+    erase("script")
+
+// ── the pages a statement asks for, as the tree moves ────────────────
+
+@test
+fn test_a_tree_that_grows_asks_the_driver_for_pages() [fs, io]
+    // A tree with more rows in it than one leaf holds makes the engine
+    // ask for a page in the middle of a statement, and the driver's
+    // whole job is answering that — so the rows are the assertion.
+    erase("grow-tree")
+    let p = match pager.create(scratch("grow-tree"), 4096)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(p)  => p
+    var inserts: [Str] = []
+    var i = 0
+    while i < 500
+        inserts = list.push(inserts, "INSERT INTO t VALUES (" + str.from_int(i) + ", "
+                                     + str.from_int(i * 7) + ")")
+        i = i + 1
+    let script = "CREATE TABLE t (a INTEGER, b INTEGER); " + str.join(inserts, "; ")
+                 + "; SELECT a FROM t;"
+    let out = match driver.execute_script(p, script)
+        Err(e)  =>
+            return test.fail(e.message())
+        Ok(out) => out
+    test.assert_eq(list.len(out.rows), 500)
+    test.assert_eq(out.rows_affected, 500)
+    let _ = pager.close(out.pager)
+    // And the file takes them: a tree that grew onto new pages is a
+    // tree the next open finds.
+    let reopened = match pager.open(scratch("grow-tree"))
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    let loaded = match driver.load_schema(reopened)
+        Err(e)  =>
+            return test.fail(e.message())
+        Ok(got) => got
+    let counted = match driver.execute(loaded.pager, "SELECT a FROM t", [])
+        Err(e)  =>
+            return test.fail(e.message())
+        Ok(got) => got
+    test.assert_eq(list.len(counted.rows), 500)
+    let _ = pager.close(counted.pager)
+    erase("grow-tree")
+
+@test
+fn test_a_file_too_short_to_hold_its_header_is_refused() [fs, io]
+    // A file that starts with the right magic and stops is a torn write
+    // and not an empty database: opening it says which bytes are
+    // missing rather than reading zeros as a header.
+    erase("short-file")
+    let db = scratch("short-file")
+    test.assert_true(put_bytes(db, [78, 86, 80, 71, 0, 0, 0, 1, 0, 0, 16, 0]),
+                     "twelve bytes of a header")
+    match pager.open(db)
+        Ok(_)  =>
+            return test.fail("twelve bytes are not a header")
+        Err(e) =>
+            match e
+                ShortRead(_, _, _) => test.assert_true(true, "it says how short the file is")
+                BadFormat(_)       => test.assert_true(true, "or which bytes are wrong")
+                _                  =>
+                    return test.fail("a short file is one of those two")
+    erase("short-file")
+
+// ── the wrong device, and the file that is not what it says ──────────
+
+@test
+fn test_a_free_list_head_that_is_not_a_page_is_refused() [fs, io]
+    // A free of a page the file has not written is accepted, because a
+    // tree that grew and shrank inside one transaction frees exactly
+    // that.  The reuse is where it runs out: the head is read, and
+    // there is nothing there to read.
+    erase("bad-head")
+    let p = match pager.create(scratch("bad-head"), 4096)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(p)  => p
+    let open_tx = match pager.begin(p)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    let freed = match pager.free_page(open_tx, 999999)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    let committed = match pager.commit(freed)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    test.assert_eq(pager.header(committed).freelist_head, 999999)
+    test.assert_eq(pager.header(committed).freelist_count, 1)
+    match pager.alloc_page(committed, 0)
+        Ok(_)  =>
+            return test.fail("there is no page 999999 to reuse")
+        Err(e) =>
+            match e
+                NoSuchPage(_, _) => test.assert_true(true, "the head is not a page of this file")
+                _                =>
+                    return test.fail("that is what NoSuchPage is for")
+    // The driver puts the same request through the same pager, so its
+    // own arm answers the same way and it is the pager's refusal.
+    match driver.answer(committed, PrAllocPage(0))
+        Ok(_)  =>
+            return test.fail("there is no page 999999 to reuse")
+        Err(e) =>
+            match e
+                Storage(_) => test.assert_true(true, "the pager refused it, not the driver")
+                _          =>
+                    return test.fail("that is what Storage is for")
+    let _ = pager.close(committed)
+    erase("bad-head")
+
+@test
+fn test_a_free_list_count_that_would_go_negative_stays_at_zero() [fs, io]
+    // A header with a head and no count is a file another tool wrote.
+    // Reusing the head would take the count below zero, so it stops
+    // there: the page is handed over and the list is empty after it.
+    erase("zero-count")
+    let db = scratch("zero-count")
+    let header = pagefmt.encode_db_header(DbHeader { version: 1, page_size: 4096, page_count: 2,
+                                                     freelist_head: 2, freelist_count: 0,
+                                                     change_counter: 0, schema_cookie: 0,
+                                                     catalog_root: 2 })
+    test.assert_true(put_bytes(db, list.append(padded(header, 4096), list.zeros(4096))),
+                     "two pages, and a free list of one page")
+    let p = match pager.open(db)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(p)  => p
+    let reused = match pager.alloc_page(p, 0)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(a)  => a
+    test.assert_eq(reused.page_id, 2)
+    test.assert_eq(pager.header(reused.pager).freelist_head, 0)
+    test.assert_eq(pager.header(reused.pager).freelist_count, 0)
+    let _ = pager.close(reused.pager)
+    erase("zero-count")
+
+@test
+fn test_a_free_request_from_a_caller_holding_the_tree() [fs, io]
+    // `answer` is published for a caller driving a btree cursor with no
+    // SQL layer above it, so a free that succeeds is that caller's own
+    // page going back on the list.
+    erase("caller-free")
+    let p = match pager.create(scratch("caller-free"), 4096)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(p)  => p
+    let open_tx = match pager.begin(p)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    let wrote = match driver.answer(open_tx, PrWritePage(2, padded([4], 4096)))
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(a)  => a
+    test.assert_eq(list.len(wrote.page), 0)
+    let freed = match driver.answer(wrote.pager, PrFreePage(2))
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(a)  => a
+    test.assert_eq(list.len(freed.page), 0)
+    test.assert_eq(pager.header(freed.pager).freelist_head, 2)
+    let committed = match pager.commit(freed.pager)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    test.assert_eq(pager.header(committed).freelist_count, 1)
+    let _ = pager.close(committed)
+    erase("caller-free")
+
+@test
+fn test_a_log_that_will_not_take_its_first_frame_is_a_storage_error() [fs, io]
+    // A log is written at its first frame, header and all, so a device
+    // that refuses the write refuses the whole log: nothing is half
+    // there and the caller hears which write the system turned down.
+    if fs.exists("/dev/full")
+        erase("first-frame")
+        let p = match pager.create(scratch("first-frame"), 4096)
+            Err(e) =>
+                return test.fail(e.message())
+            Ok(p)  => p
+        test.assert_true(fs.symlink("/dev/full", log_of(scratch("first-frame"))),
+                         "the log path becomes the full device")
+        let open_tx = match pager.begin(p)
+            Err(e) =>
+                return test.fail(e.message())
+            Ok(q)  => q
+        match pager.free_page(open_tx, 3)
+            Ok(_)  =>
+                return test.fail("the device refuses writes")
+            Err(e) =>
+                match e
+                    IoFailed(_, _) => test.assert_true(true, "the system refused the log header")
+                    _              =>
+                        return test.fail("that is what IoFailed is for")
+        // The same pager, still without a log, at a commit: the header
+        // is what a commit needs first, and it fails there as well.
+        match pager.commit(open_tx)
+            Ok(_)  =>
+                return test.fail("the commit writes the log header first")
+            Err(e) =>
+                match e
+                    IoFailed(_, _) => test.assert_true(true, "the same device, the same refusal")
+                    _              =>
+                        return test.fail("that is what IoFailed is for")
+        let _ = fs.delete(log_of(scratch("first-frame")))
+        let _ = pager.close(p)
+        erase("first-frame")
+    else
+        test.assert_true(true, "this machine has no /dev/full to refuse a write")
+
+@test
+fn test_a_log_that_will_not_take_a_later_frame_is_a_storage_error() [fs, io]
+    // Once the log is there the frames go into it by path, so a device
+    // that takes the first frame and refuses the next one is a write
+    // that fails with the pager the caller already had.
+    if fs.exists("/dev/full")
+        erase("later-frame")
+        let p = match pager.create(scratch("later-frame"), 4096)
+            Err(e) =>
+                return test.fail(e.message())
+            Ok(p)  => p
+        let open_tx = match pager.begin(p)
+            Err(e) =>
+                return test.fail(e.message())
+            Ok(q)  => q
+        let wrote = match pager.write_page(open_tx, 2, padded([7], 4096))
+            Err(e) =>
+                return test.fail(e.message())
+            Ok(q)  => q
+        test.assert_true(fs.delete(log_of(scratch("later-frame"))), "the log is removed")
+        test.assert_true(fs.symlink("/dev/full", log_of(scratch("later-frame"))),
+                         "the log becomes the full device")
+        match pager.free_page(wrote, 3)
+            Ok(_)  =>
+                return test.fail("the device refuses writes")
+            Err(e) =>
+                match e
+                    IoFailed(_, _) => test.assert_true(true, "the system refused the frame")
+                    _              =>
+                        return test.fail("that is what IoFailed is for")
+        match pager.commit(wrote)
+            Ok(_)  =>
+                return test.fail("the commit frame is refused too")
+            Err(e) =>
+                match e
+                    IoFailed(_, _) => test.assert_true(true, "the commit frame is a frame")
+                    _              =>
+                        return test.fail("that is what IoFailed is for")
+        let _ = fs.delete(log_of(scratch("later-frame")))
+        let _ = pager.close(p)
+        erase("later-frame")
+    else
+        test.assert_true(true, "this machine has no /dev/full to refuse a write")
+
+@test
+fn test_a_log_that_is_not_a_log_is_refused() [fs, io]
+    // The log beside a good database is only a log because of its
+    // header: bytes with the wrong magic are a pair that does not go
+    // together, and the database is fine.
+    erase("bad-log")
+    let db = scratch("bad-log")
+    let p = match pager.create(db, 4096)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(p)  => p
+    let _ = pager.close(p)
+    test.assert_true(put_bytes(log_of(db), padded(word_bytes(1), 64)),
+                     "a log whose magic is not this format's")
+    match pager.open(db)
+        Ok(_)  =>
+            return test.fail("that is not a log header")
+        Err(e) =>
+            match e
+                BadFormat(_) => test.assert_true(true, "the log's header is what is wrong")
+                _            =>
+                    return test.fail("that is what BadFormat is for")
+    erase("bad-log")
+
+@test
+fn test_an_empty_log_file_is_a_short_read() [fs, io]
+    // A log of no bytes at all is a torn write that took the header
+    // with it, and the read comes back with the zero bytes that are
+    // there rather than with a header.
+    erase("empty-log")
+    let db = scratch("empty-log")
+    let p = match pager.create(db, 4096)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(p)  => p
+    let _ = pager.close(p)
+    test.assert_true(put_bytes(log_of(db), []), "an empty log")
+    match pager.open(db)
+        Ok(_)  =>
+            return test.fail("an empty log is not a log")
+        Err(e) =>
+            match e
+                ShortRead(_, got, want) =>
+                    test.assert_eq(got, 0)
+                    test.assert_eq(want, 32)
+                _                       =>
+                    return test.fail("that is what ShortRead is for")
+    erase("empty-log")
+
+@test
+fn test_a_page_one_frame_that_is_not_a_header_is_ignored() [fs, io]
+    // Page one is where the header lives, so a frame holding it is
+    // where a running header would come from.  A frame that does not
+    // hold one leaves the header the file's and the log a log, because
+    // refusing the file over it would lose the rows beside it.
+    erase("junk-header")
+    let p = match pager.create(scratch("junk-header"), 4096)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(p)  => p
+    let open_tx = match pager.begin(p)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    let wrote = match pager.write_page(open_tx, 2, padded([9], 4096))
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    var junk: [Int] = []
+    var i = 0
+    while i < 4096
+        junk = list.push(junk, 255)
+        i = i + 1
+    let wrote2 = match pager.write_page(wrote, 1, junk)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    let committed = match pager.commit(wrote2)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    let _ = pager.close(committed)
+    let reopened = match pager.open(scratch("junk-header"))
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    test.assert_eq(pager.header(reopened).page_size, 4096)
+    test.assert_eq(pager.stats(reopened).wal_frames, 3)
+    let _ = pager.close(reopened)
+    erase("junk-header")
+
+@test
+fn test_a_checkpoint_that_cannot_write_a_page_says_so() [fs, io]
+    // The checkpoint moves the log into the database file, so a
+    // database the system will not take leaves the frames where they
+    // are: a checkpoint that half landed would be their only copy.
+    if fs.exists("/dev/full")
+        erase("full-db")
+        let p = match pager.create(scratch("full-db"), 4096)
+            Err(e) =>
+                return test.fail(e.message())
+            Ok(p)  => p
+        let open_tx = match pager.begin(p)
+            Err(e) =>
+                return test.fail(e.message())
+            Ok(q)  => q
+        let wrote = match pager.write_page(open_tx, 2, padded([3], 4096))
+            Err(e) =>
+                return test.fail(e.message())
+            Ok(q)  => q
+        let committed = match pager.commit(wrote)
+            Err(e) =>
+                return test.fail(e.message())
+            Ok(q)  => q
+        test.assert_true(pager.stats(committed).wal_frames > 0, "there is something to move")
+        test.assert_true(fs.delete(scratch("full-db")), "the database file is removed")
+        test.assert_true(fs.symlink("/dev/full", scratch("full-db")),
+                         "the database path becomes the full device")
+        match pager.checkpoint(committed)
+            Ok(_)  =>
+                return test.fail("the device refuses writes")
+            Err(e) =>
+                match e
+                    IoFailed(_, _) => test.assert_true(true, "the system refused the database write")
+                    _              =>
+                        return test.fail("that is what IoFailed is for")
+        test.assert_true(pager.stats(committed).wal_frames > 0, "the frames are still in the log")
+        let _ = fs.delete(scratch("full-db"))
+        let _ = pager.close(committed)
+        erase("full-db")
+    else
+        test.assert_true(true, "this machine has no /dev/full to refuse a write")
+
+@test
+fn test_a_script_whose_catalog_is_too_wide_rolls_back() [fs, io]
+    // A script's catalog goes in with its data, so a catalog that does
+    // not fit is a script that does not happen: the transaction is
+    // rolled back and the caller hears which page refused it.
+    erase("wide-script")
+    let p = match pager.create(scratch("wide-script"), 4096)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(p)  => p
+    var names: [Str] = []
+    var i = 0
+    while i < 400
+        names = list.push(names, "c" + str.from_int(i) + " INTEGER")
+        i = i + 1
+    let wide = "CREATE TABLE w (" + str.join(names, ", ") + ")"
+    match driver.execute_script(p, wide)
+        Ok(_)  =>
+            return test.fail("that schema does not fit in one page")
+        Err(e) =>
+            match e
+                Protocol(_) => test.assert_true(true, "the catalog page is what cannot hold it")
+                _           =>
+                    return test.fail("that is what Protocol is for")
+    // Nothing of it landed: the file's catalog is the empty one it was.
+    let loaded = match driver.load_schema(p)
+        Err(e)  =>
+            return test.fail(e.message())
+        Ok(got) => got
+    test.assert_eq(list.len(loaded.schema.tables), 0)
+    let _ = pager.close(loaded.pager)
+    erase("wide-script")
+
+@test
+fn test_a_catalog_that_will_not_load_stops_both_entry_points() [fs, io]
+    // Both entry points read the catalog before anything else, so a
+    // page whose line is not a table is refused before a statement is
+    // prepared, and a caller who already holds a transaction hears the
+    // pager's refusal of a second one.
+    erase("bad-line")
+    let p = match pager.create(scratch("bad-line"), 4096)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(p)  => p
+    let open_tx = match pager.begin(p)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    let root = pager.header(open_tx).catalog_root
+    let written = match pager.write_page(open_tx, root, text_bytes("table 2 1 0 SELECT 1", 4096))
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    let committed = match pager.commit(written)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    match driver.execute(committed, "SELECT 1", [])
+        Ok(_)  =>
+            return test.fail("that line is not a table")
+        Err(e) =>
+            match e
+                Protocol(_) => test.assert_true(true, "the catalog is what the driver cannot read")
+                _           =>
+                    return test.fail("that is what Protocol is for")
+    match driver.execute_script(committed, "SELECT 1")
+        Ok(_)  =>
+            return test.fail("that line is not a table")
+        Err(e) =>
+            match e
+                Protocol(_) => test.assert_true(true, "the script reads the same page")
+                _           =>
+                    return test.fail("that is what Protocol is for")
+    let _ = pager.close(committed)
+    // A transaction of the caller's own is what the driver's begin
+    // finds already there, on either entry point.  The catalog is a
+    // good one here, so the pager's refusal is what comes back.
+    erase("held-tx")
+    let plain = match pager.create(scratch("held-tx"), 4096)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(p)  => p
+    let held = match pager.begin(plain)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    match driver.execute(held, "SELECT 1", [])
+        Ok(_)  =>
+            return test.fail("the driver's begin is a second one")
+        Err(e) =>
+            match e
+                Storage(_) => test.assert_true(true, "the pager refused the second begin")
+                _          =>
+                    return test.fail("that is what Storage is for")
+    match driver.execute_script(held, "SELECT 1")
+        Ok(_)  =>
+            return test.fail("the driver's begin is a second one")
+        Err(e) =>
+            match e
+                Storage(_) => test.assert_true(true, "and the script hears the same thing")
+                _          =>
+                    return test.fail("that is what Storage is for")
+    let _ = pager.close(held)
+    erase("held-tx")
+    erase("bad-line")
+
+@test
+fn test_a_tree_that_is_not_a_tree_stops_the_statement() [fs, io]
+    // The engine walks a table's pages through the host, and a page
+    // that is not a tree is a fault the engine reports mid-statement:
+    // the caller hears the engine's error and no rows come back.
+    erase("junk-tree")
+    let p = match pager.create(scratch("junk-tree"), 4096)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(p)  => p
+    let made = match driver.execute(p, "CREATE TABLE t (a INTEGER)", [])
+        Err(e)  =>
+            return test.fail(e.message())
+        Ok(out) => out
+    let saved = match save_schema(made.pager, made.schema)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    // A statement is what gives the table its tree, so it takes one
+    // before the page can be spoiled.
+    let filled = match driver.execute(saved, "INSERT INTO t VALUES (1)", [])
+        Err(e)  =>
+            return test.fail(e.message())
+        Ok(out) => out
+    var root = 0
+    for t in filled.schema.tables
+        if t.name == "t"
+            root = t.root_page
+    test.assert_true(root > 0, "the table has a tree")
+    let tx2 = match pager.begin(filled.pager)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    var junk: [Int] = []
+    var i = 0
+    while i < 4096
+        junk = list.push(junk, 255)
+        i = i + 1
+    let spoiled = match pager.write_page(tx2, root, junk)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    let done = match pager.commit(spoiled)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    match driver.execute(done, "SELECT a FROM t", [])
+        Ok(_)  =>
+            return test.fail("that page is not a tree")
+        Err(e) =>
+            match e
+                Engine(_) => test.assert_true(true, "the engine is what refused it")
+                _         =>
+                    return test.fail("that is what Engine is for")
+    match driver.execute_script(done, "SELECT a FROM t")
+        Ok(_)  =>
+            return test.fail("that page is not a tree")
+        Err(e) =>
+            match e
+                Engine(_) => test.assert_true(true, "and a script hears it from its statement")
+                _         =>
+                    return test.fail("that is what Engine is for")
+    let _ = pager.close(done)
+    erase("junk-tree")
+
+@test
+fn test_a_file_shorter_than_its_header_claims_is_a_short_read() [fs, io]
+    // A header that counts pages the file does not have is a truncated
+    // file, and the read that runs past the end says how many bytes
+    // were there: none of them.
+    erase("truncated")
+    let db = scratch("truncated")
+    let header = pagefmt.encode_db_header(DbHeader { version: 1, page_size: 4096, page_count: 3,
+                                                     freelist_head: 0, freelist_count: 0,
+                                                     change_counter: 0, schema_cookie: 0,
+                                                     catalog_root: 2 })
+    test.assert_true(put_bytes(db, padded(header, 4096)), "one page of a three-page database")
+    let p = match pager.open(db)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(p)  => p
+    match pager.read_page(p, 3)
+        Ok(_)  =>
+            return test.fail("page 3 is not in the file")
+        Err(e) =>
+            match e
+                ShortRead(_, got, want) =>
+                    test.assert_eq(got, 0)
+                    test.assert_eq(want, 4096)
+                NoSuchPage(_, _)        =>
+                    return test.fail("the header said there are three pages")
+                _                       =>
+                    return test.fail("a short file is one of those two")
+    let _ = pager.close(p)
+    erase("truncated")
+
+@test
+fn test_a_checkpoint_that_cannot_retire_the_log_says_so() [fs, io]
+    // The database is written first and the log retired second, so a
+    // log the system will not take leaves the frames where they are:
+    // the pages are in both files and the caller runs it again.
+    if fs.exists("/dev/full")
+        erase("full-log")
+        let p = match pager.create(scratch("full-log"), 4096)
+            Err(e) =>
+                return test.fail(e.message())
+            Ok(p)  => p
+        let open_tx = match pager.begin(p)
+            Err(e) =>
+                return test.fail(e.message())
+            Ok(q)  => q
+        let wrote = match pager.write_page(open_tx, 2, padded([5], 4096))
+            Err(e) =>
+                return test.fail(e.message())
+            Ok(q)  => q
+        let committed = match pager.commit(wrote)
+            Err(e) =>
+                return test.fail(e.message())
+            Ok(q)  => q
+        test.assert_true(fs.delete(log_of(scratch("full-log"))), "the log is removed")
+        test.assert_true(fs.symlink("/dev/full", log_of(scratch("full-log"))),
+                         "the log becomes the full device")
+        match pager.checkpoint(committed)
+            Ok(_)  =>
+                return test.fail("the device refuses writes")
+            Err(e) =>
+                match e
+                    IoFailed(_, _) => test.assert_true(true, "the system refused the log header")
+                    _              =>
+                        return test.fail("that is what IoFailed is for")
+        test.assert_true(pager.stats(committed).wal_frames > 0, "the frames are still the log's")
+        let _ = fs.delete(log_of(scratch("full-log")))
+        let _ = pager.close(committed)
+        erase("full-log")
+    else
+        test.assert_true(true, "this machine has no /dev/full to refuse a write")
+
+@test
+fn test_a_tree_that_grows_onto_a_free_list_that_is_not_there() [fs, io]
+    // The engine asks the host for a page when a leaf has to split, and
+    // the host asks the free list first.  A head that is not a page of
+    // this file is the pager's error, and the statement stops with it
+    // rather than writing into a page that is not there.
+    erase("bad-head-tree")
+    let p = match pager.create(scratch("bad-head-tree"), 4096)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(p)  => p
+    let made = match driver.execute(p, "CREATE TABLE t (a INTEGER, b INTEGER)", [])
+        Err(e)  =>
+            return test.fail(e.message())
+        Ok(out) => out
+    let saved = match save_schema(made.pager, made.schema)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    // The first statement is what gives the table its tree, and it runs
+    // while the free list is still a good one.
+    let first = match driver.execute(saved, "INSERT INTO t VALUES (1, 1)", [])
+        Err(e)  =>
+            return test.fail(e.message())
+        Ok(out) => out
+    test.assert_eq(first.rows_affected, 1)
+    let tx2 = match pager.begin(first.pager)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    let freed = match pager.free_page(tx2, 999999)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    let spoiled = match pager.commit(freed)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    test.assert_eq(pager.header(spoiled).freelist_head, 999999)
+    var inserts: [Str] = []
+    var i = 0
+    while i < 500
+        inserts = list.push(inserts, "INSERT INTO t VALUES (" + str.from_int(i) + ", 0)")
+        i = i + 1
+    match driver.execute_script(spoiled, str.join(inserts, "; "))
+        Ok(_)  =>
+            return test.fail("there is no page 999999 to grow onto")
+        Err(e) =>
+            match e
+                Storage(_) => test.assert_true(true, "the pager refused the allocation")
+                _          =>
+                    return test.fail("that is what Storage is for")
+    let _ = pager.close(spoiled)
+    erase("bad-head-tree")
+
+@test
+fn test_a_checkpoint_that_cannot_open_the_log_says_so() [fs, io]
+    // The pages are in the database file by the time the log is opened
+    // to be retired, so a log the system will not open leaves a file
+    // that holds them twice and a caller who runs it again.
+    erase("log-dir")
+    let p = match pager.create(scratch("log-dir"), 4096)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(p)  => p
+    let open_tx = match pager.begin(p)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    let wrote = match pager.write_page(open_tx, 2, padded([6], 4096))
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    let committed = match pager.commit(wrote)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    test.assert_true(fs.delete(log_of(scratch("log-dir"))), "the log is removed")
+    test.assert_true(fs.mkdir(log_of(scratch("log-dir"))), "a directory takes the log's place")
+    match pager.checkpoint(committed)
+        Ok(_)  =>
+            return test.fail("a directory is not a log")
+        Err(e) =>
+            match e
+                IoFailed(_, _) => test.assert_true(true, "the system refused the open")
+                _              =>
+                    return test.fail("that is what IoFailed is for")
+    test.assert_true(pager.stats(committed).wal_frames > 0, "the frames are still the log's")
+    let _ = fs.delete(log_of(scratch("log-dir")))
+    let _ = pager.close(committed)
+    erase("log-dir")
+
+@test
+fn test_a_rollback_whose_page_one_is_not_a_header_says_so() [fs, io]
+    // A rollback goes back to page one as the last commit wrote it, and
+    // reads it rather than keeping a second copy for the length of a
+    // transaction.  A database whose page one is not a header is
+    // therefore a rollback that cannot say where to go back to.
+    erase("broken-page-one")
+    let db = scratch("broken-page-one")
+    let p = match pager.create(db, 4096)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(p)  => p
+    test.assert_true(bump_file_byte(db, 0), "the magic moves on by one byte")
+    let open_tx = match pager.begin(p)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    match pager.rollback(open_tx)
+        Ok(_)  =>
+            return test.fail("that page is not a header")
+        Err(e) =>
+            match e
+                BadFormat(_) => test.assert_true(true, "the page is what is wrong")
+                _            =>
+                    return test.fail("that is what BadFormat is for")
+    let _ = pager.close(open_tx)
+    erase("broken-page-one")

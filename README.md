@@ -11,12 +11,6 @@ is the design this package follows. It answers the page requests that
 [sql-engine-nv](https://novo-lang.org/packages/sql-engine-nv) make, and
 it is the only one of the three that opens a file.
 
-**Status: NOT IMPLEMENTED — interface only.** Every function is
-declared with its full signature, but every body is a `todo()` that
-panics when called. The package is published so its design can be
-reviewed and depended on before it is implemented. Version 0.1.0 will
-be the first working release.
-
 ## What it is
 
 A database here is two files: the **database file**, which holds the
@@ -136,10 +130,7 @@ fn main() [io, fs]
                 Ok(out) => println("${out.rows_affected} rows")
 ```
 
-Build and test with `novo pkg build` and `novo test`. Today `novo test`
-fails on purpose: every test reaches a
-`not implemented: pager-nv.<module>.<fn>` panic. The tests are the
-specification the implementation will have to satisfy.
+Build with `novo pkg build` and run the suites with `novo test`.
 
 ## What the package contains
 
@@ -269,9 +260,10 @@ with its own structure over pages uses `read_page`, `write_page`,
 ## Tests
 
 ```bash
-novo test tests/pagefmt_tests.nv   # 14 tests: the two headers and the frame, by offset
-novo test tests/pager_tests.nv     # 19 tests: the file, the log, and recovery
-novo test tests/driver_tests.nv    # 12 tests: the page-request loop
+novo test tests/pagefmt_tests.nv    # 14 tests: the two headers and the frame, by offset
+novo test tests/pager_tests.nv      # 19 tests: the file, the log, and recovery
+novo test tests/driver_tests.nv     # 12 tests: the page-request loop
+novo test tests/pager_edge_tests.nv # 53 tests: the wrong file, the wrong device, the catalog
 ```
 
 The reference implementation is SQLite's pager and its write-ahead
@@ -289,27 +281,19 @@ refused while a snapshot is held, that a free is deferred under one,
 that a nested `begin` is refused, and that a WAL whose page size
 differs from the database's is not read.
 
-The tests compile today and fail at run, each on the
-`not implemented: pager-nv.<module>.<fn>` panic that is its body. That
-is the expected state of an interface release. They turn green one at
-a time as bodies land.
+`pager_edge_tests.nv` writes the bytes a wrong file is made of: a
+header with the wrong magic, a frame with one byte moved, a log from
+before the checkpoint, a file shorter than its header claims, a device
+that refuses a write, a tree whose root page is not a tree. A reader
+is only as good as the wrong files it refuses.
 
-## Implementation status
-
-| Item | Implemented |
-| --- | --- |
-| `pagefmt.db_header_size`, `.wal_header_size`, `.wal_frame_header_size`, `.default_page_size` | no |
-| `pagefmt.new_db_header`, `.encode_db_header`, `.decode_db_header` | no |
-| `pagefmt.encode_wal_header`, `.decode_wal_header`, `.encode_wal_frame`, `.decode_wal_frame` | no |
-| `pagefmt.checksum_seed`, `.checksum`, `.frame_is_current`, `.frame_offset` | no |
-| `pagefmt.FormatError.message` | no |
-| `pager.open`, `.create`, `.close` | no |
-| `pager.read_page`, `.read_page_at`, `.write_page`, `.alloc_page`, `.free_page` | no |
-| `pager.snapshot`, `.release`, `.begin`, `.commit`, `.rollback`, `.checkpoint` | no |
-| `pager.header`, `.page_size`, `.page_count`, `.stats`, `.set_cache_limit` | no |
-| `pager.now_snapshot`, `PagerError.message` | no |
-| `driver.execute`, `.execute_script`, `.next_row`, `.step_once`, `.answer` | no |
-| `driver.load_schema`, `.store_schema`, `DriveError.message` | no |
+One test does not pass. `pagefmt_tests.test_a_corrupted_wal_header_is_refused`
+zeroes byte 16 of an encoded WAL header and expects the checksum to
+stop decoding it, but byte 16 is the high byte of the big-endian salt
+1 the test wrote as 111, so the bytes do not move and the header
+decodes. It is recorded in `CHANGELOG.md` under `### Known` rather
+than worked around: the other reading of it — little-endian salts —
+contradicts the one byte order this file states.
 
 ## Licence
 

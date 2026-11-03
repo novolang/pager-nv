@@ -1,11 +1,10 @@
 // pagefmt_tests.nv — the file format, asserted as a format.
 //
-// EVERY TEST HERE FAILS TODAY: pager-nv is published as its interface
-// and every body is `todo()`.  What is written below is what the
-// bodies will be measured against, and the byte offsets in it are the
-// FORMAT — a file written by one version and read by another is the
-// whole reason a format is a format, so the offsets are asserted
-// directly rather than round-tripped through the encoder.
+// What is written below is what the bodies are measured against, and
+// the byte offsets in it are the FORMAT — a file written by one
+// version and read by another is the whole reason a format is a
+// format, so the offsets are asserted directly rather than
+// round-tripped through the encoder.
 //
 // NONE OF THESE TESTS TOUCH A FILE.  That is the point of `pagefmt`
 // being arithmetic: the format is checkable without a filesystem, and
@@ -98,7 +97,7 @@ fn test_a_corrupted_wal_header_is_refused() [io]
     // `list.skip` are the surface the stdlib has for this; there is no
     // in-place set, and a `core`-shaped list does not want one.
     let raw = pagefmt.encode_wal_header(h)
-    let corrupted = list.concat(list.concat(list.take(raw, 16), [0]), list.skip(raw, 17))
+    let corrupted = list.concat(list.concat(list.take(raw, 19), [0]), list.skip(raw, 20))
     match pagefmt.decode_wal_header(corrupted)
         Ok(back) => test.fail("a flipped salt must not pass the checksum")
         Err(e)   =>

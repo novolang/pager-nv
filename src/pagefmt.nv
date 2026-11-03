@@ -60,6 +60,43 @@
 // everything on every commit.  The frame format above is designed here
 // against SQLite's, which is the reference the must-have plan names.
 
+use std.list
+
+// ── bytes out, bytes in ──────────────────────────────────────────────
+
+// Big-endian because the layout says so: one byte order for the whole
+// format, so a file written on one machine reads on the next.
+fn be_u32(v: Int) -> [Int]
+    [(v >>> 24) & 255, (v >>> 16) & 255, (v >>> 8) & 255, v & 255]
+
+// Four bytes as a 32-bit word.  `list.get`'s three-argument form pads
+// with zeros, so a word that runs past the end reads as a short word
+// instead of failing — which is the tail the rolling checksum needs.
+fn u32_at(bytes: [Int], at: Int) -> Int
+    let b0 = list.get(bytes, at, 0)
+    let b1 = list.get(bytes, at + 1, 0)
+    let b2 = list.get(bytes, at + 2, 0)
+    let b3 = list.get(bytes, at + 3, 0)
+    (b0 << 24) | (b1 << 16) | ((b2 << 8) | b3)
+
+// A power of two from 512 to 65536, which is SQLite's range and what
+// every offset in this package is computed on.
+fn page_size_ok(size: Int) -> Bool
+    size >= 512 and size <= 65536 and (size & (size - 1)) == 0
+
+// The four bytes a file of this format starts with, named so that the
+// check in the decoders reads as a magic and not as four numbers.
+fn db_magic() -> [Int]
+    [78, 86, 80, 71]
+
+fn wal_magic() -> [Int]
+    [78, 86, 87, 76]
+
+// The one format version this build reads.  A second one bumps this,
+// and the reader that cannot read it says so instead of guessing.
+fn format_version() -> Int
+    1
+
 // The 48-byte database header, decoded.
 pub struct DbHeader
     version: Int
@@ -102,15 +139,15 @@ pub struct WalFrame
 
 // The size of the database header in bytes.
 pub fn db_header_size() -> Int
-    todo("pager-nv.pagefmt.db_header_size")
+    48
 
 // The size of the WAL header in bytes.
 pub fn wal_header_size() -> Int
-    todo("pager-nv.pagefmt.wal_header_size")
+    32
 
 // The size of a WAL frame header in bytes.
 pub fn wal_frame_header_size() -> Int
-    todo("pager-nv.pagefmt.wal_frame_header_size")
+    24
 
 // The default page size for a file this pager creates.
 //
@@ -118,21 +155,57 @@ pub fn wal_frame_header_size() -> Int
 // filesystem's block size.  A file may declare another in its header
 // and this pager will read it; it writes this one.
 pub fn default_page_size() -> Int
-    todo("pager-nv.pagefmt.default_page_size")
+    4096
 
 // A fresh database header for an empty file.
 pub fn new_db_header(page_size: Int) -> DbHeader
-    todo("pager-nv.pagefmt.new_db_header")
+    // Page 1 holds this header, so an empty file is one page.  The
+    // change counter is zero: it counts commits, and there have been
+    // none.  Nothing here checks the page size — a header is built and
+    // then encoded, and the encoder writes what it was given.
+    DbHeader { version: format_version(), page_size: page_size, page_count: 1,
+               freelist_head: 0, freelist_count: 0, change_counter: 0,
+               schema_cookie: 0, catalog_root: 0 }
 
 // Write the database header out.
 //
 // Returns exactly `db_header_size()` bytes.
 pub fn encode_db_header(h: DbHeader) -> [Int]
-    todo("pager-nv.pagefmt.encode_db_header")
+    var out = db_magic()
+    out = list.append(out, be_u32(h.version))
+    out = list.append(out, be_u32(h.page_size))
+    out = list.append(out, be_u32(h.page_count))
+    out = list.append(out, be_u32(h.freelist_head))
+    out = list.append(out, be_u32(h.freelist_count))
+    out = list.append(out, be_u32(h.change_counter))
+    out = list.append(out, be_u32(h.schema_cookie))
+    out = list.append(out, be_u32(h.catalog_root))
+    // The twelve reserved bytes, zero, which is what puts the header
+    // at its documented 48.
+    out = list.append(out, list.zeros(12))
+    out
 
 // Read the database header, or say why the bytes are not one.
 pub fn decode_db_header(bytes: [Int]) -> Result<DbHeader, FormatError>
-    todo("pager-nv.pagefmt.decode_db_header")
+    let have = list.len(bytes)
+    let magic_len = list.len(db_magic())
+    if have < magic_len
+        return Err(TooShort(want: db_header_size(), have: have))
+    let magic = list.take(bytes, magic_len)
+    if magic != db_magic()
+        return Err(BadMagic(got: magic))
+    if have < db_header_size()
+        return Err(TooShort(want: db_header_size(), have: have))
+    let version = u32_at(bytes, 4)
+    if version != format_version()
+        return Err(BadVersion(got: version, supported: format_version()))
+    let size = u32_at(bytes, 8)
+    if not page_size_ok(size)
+        return Err(BadPageSize(got: size))
+    Ok(DbHeader { version: version, page_size: size, page_count: u32_at(bytes, 12),
+                  freelist_head: u32_at(bytes, 16), freelist_count: u32_at(bytes, 20),
+                  change_counter: u32_at(bytes, 24), schema_cookie: u32_at(bytes, 28),
+                  catalog_root: u32_at(bytes, 32) })
 
 // Write the WAL header out.
 //
@@ -140,11 +213,44 @@ pub fn decode_db_header(bytes: [Int]) -> Result<DbHeader, FormatError>
 // into the last 8, so the returned header is self-consistent and
 // `decode_wal_header` will accept it.
 pub fn encode_wal_header(h: WalHeader) -> [Int]
-    todo("pager-nv.pagefmt.encode_wal_header")
+    var out = wal_magic()
+    out = list.append(out, be_u32(h.version))
+    out = list.append(out, be_u32(h.page_size))
+    out = list.append(out, be_u32(h.checkpoint_seq))
+    out = list.append(out, be_u32(h.salt1))
+    out = list.append(out, be_u32(h.salt2))
+    // The twenty-four bytes above ARE the checksum's input, which is
+    // why they are assembled before the two words are.
+    let c = checksum(Checksum { s1: 0, s2: 0 }, out)
+    out = list.append(out, be_u32(c.s1))
+    out = list.append(out, be_u32(c.s2))
+    out
 
 // Read the WAL header, checking both checksums.
 pub fn decode_wal_header(bytes: [Int]) -> Result<WalHeader, FormatError>
-    todo("pager-nv.pagefmt.decode_wal_header")
+    let have = list.len(bytes)
+    let magic_len = list.len(wal_magic())
+    if have < magic_len
+        return Err(TooShort(want: wal_header_size(), have: have))
+    let magic = list.take(bytes, magic_len)
+    if magic != wal_magic()
+        return Err(BadMagic(got: magic))
+    if have < wal_header_size()
+        return Err(TooShort(want: wal_header_size(), have: have))
+    let stored1 = u32_at(bytes, 24)
+    let stored2 = u32_at(bytes, 28)
+    let c = checksum(Checksum { s1: 0, s2: 0 }, list.take(bytes, 24))
+    if c.s1 != stored1 or c.s2 != stored2
+        return Err(BadChecksum(page_id: 0))
+    let version = u32_at(bytes, 4)
+    if version != format_version()
+        return Err(BadVersion(got: version, supported: format_version()))
+    let size = u32_at(bytes, 8)
+    if not page_size_ok(size)
+        return Err(BadPageSize(got: size))
+    Ok(WalHeader { version: version, page_size: size, checkpoint_seq: u32_at(bytes, 12),
+                   salt1: u32_at(bytes, 16), salt2: u32_at(bytes, 20),
+                   checksum1: stored1, checksum2: stored2 })
 
 // Write a frame header out, given the running checksum before it.
 //
@@ -152,12 +258,36 @@ pub fn decode_wal_header(bytes: [Int]) -> Result<WalHeader, FormatError>
 // written without knowing what came before it, and that is what makes
 // a frame inserted into the middle of a log detectable.
 pub fn encode_wal_frame(f: WalFrame, page: [Int], running: Checksum) -> [Int]
-    todo("pager-nv.pagefmt.encode_wal_frame")
+    var out = be_u32(f.page_id)
+    out = list.append(out, be_u32(f.db_size_after))
+    out = list.append(out, be_u32(f.salt1))
+    out = list.append(out, be_u32(f.salt2))
+    // The first eight bytes are the frame's own claim about WHERE it
+    // goes; the twelve after them are salts and a checksum, and a
+    // checksum cannot cover itself.
+    let c = checksum(checksum(running, list.take(out, 8)), page)
+    out = list.append(out, be_u32(c.s1))
+    out = list.append(out, be_u32(c.s2))
+    out = list.append(out, page)
+    out
 
 // Read a frame header, checking it against the running checksum.
 pub fn decode_wal_frame(bytes: [Int], page: [Int],
                         running: Checksum) -> Result<WalFrame, FormatError>
-    todo("pager-nv.pagefmt.decode_wal_frame")
+    let have = list.len(bytes)
+    if have < wal_frame_header_size()
+        return Err(TooShort(want: wal_frame_header_size(), have: have))
+    let page_id = u32_at(bytes, 0)
+    let db_size_after = u32_at(bytes, 4)
+    let salt1 = u32_at(bytes, 8)
+    let salt2 = u32_at(bytes, 12)
+    let stored1 = u32_at(bytes, 16)
+    let stored2 = u32_at(bytes, 20)
+    let c = checksum(checksum(running, list.take(bytes, 8)), page)
+    if c.s1 != stored1 or c.s2 != stored2
+        return Err(BadChecksum(page_id: page_id))
+    Ok(WalFrame { page_id: page_id, db_size_after: db_size_after, salt1: salt1,
+                  salt2: salt2, checksum1: stored1, checksum2: stored2 })
 
 // A running checksum: two 32-bit halves.
 pub struct Checksum
@@ -166,7 +296,10 @@ pub struct Checksum
 
 // The checksum the WAL starts from, seeded by the header's salts.
 pub fn checksum_seed(h: WalHeader) -> Checksum
-    todo("pager-nv.pagefmt.checksum_seed")
+    // The header's own two words ARE the seed: they are the checksum
+    // of its first twenty-four bytes, and a frame's checksum runs on
+    // from there.
+    Checksum { s1: h.checksum1, s2: h.checksum2 }
 
 // Fold a run of bytes into the running checksum.
 //
@@ -176,7 +309,20 @@ pub fn checksum_seed(h: WalHeader) -> Checksum
 // a checksum over one frame alone would not notice a frame lifted out
 // of another log and dropped in, and this one does.
 pub fn checksum(running: Checksum, bytes: [Int]) -> Checksum
-    todo("pager-nv.pagefmt.checksum")
+    // A byte run that is not a multiple of eight is padded with zeros,
+    // which is what SQLite does and what `u32_at` does for the tail
+    // without a copy.
+    let n = list.len(bytes)
+    var s1 = running.s1
+    var s2 = running.s2
+    var i = 0
+    while i < n
+        let x0 = u32_at(bytes, i)
+        let x1 = u32_at(bytes, i + 4)
+        s1 = (s1 + x0 + s2) & 4294967295
+        s2 = (s2 + x1 + s1) & 4294967295
+        i = i + 8
+    Checksum { s1: s1, s2: s2 }
 
 // True when a frame's salts match this WAL header's.
 //
@@ -184,12 +330,12 @@ pub fn checksum(running: Checksum, bytes: [Int]) -> Checksum
 // left in the file because the log is written in place and never
 // truncated.  Recovery stops at the first one.
 pub fn frame_is_current(f: WalFrame, h: WalHeader) -> Bool
-    todo("pager-nv.pagefmt.frame_is_current")
+    f.salt1 == h.salt1 and f.salt2 == h.salt2
 
 // The byte offset of frame `n`, zero-based, in a WAL of this page
 // size.
 pub fn frame_offset(page_size: Int, n: Int) -> Int
-    todo("pager-nv.pagefmt.frame_offset")
+    wal_header_size() + n * (wal_frame_header_size() + page_size)
 
 // Why a run of bytes is not the header or frame it claimed to be.
 pub enum FormatError
@@ -211,4 +357,16 @@ pub enum FormatError
 // The human sentence behind each way a header or frame can be wrong.
 impl Error for FormatError
     fn message(self) -> Str
-        todo("pager-nv.pagefmt.FormatError.message")
+        match self
+            BadMagic(_)            =>
+                "not a pager-nv file: the first four bytes are not its magic"
+            BadVersion(_, _)       =>
+                "the file's format version is one this build does not read"
+            TooShort(_, _)         =>
+                "the buffer is shorter than the structure it was asked for"
+            BadChecksum(_)         =>
+                "a checksum did not match, so these are not the bytes that were written"
+            BadPageSize(_)         =>
+                "the page size is not a power of two between 512 and 65536"
+            PageSizeMismatch(_, _) =>
+                "the log's page size and the database's disagree, so the two files are not a pair"
