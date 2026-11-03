@@ -18,7 +18,7 @@ tags        = ["pager", "wal", "sqlite", "page-cache", "durability", "database",
 repository  = "https://github.com/novolang/pager-nv"
 bugs        = "https://github.com/novolang/pager-nv/issues"
 maintainers = ["novo-lang"]
-novo        = ">= 0.20.2"
+novo        = ">= 0.23.0"
 
 # A library: no `main`, so `novo pkg build` type-checks and
 # effect-checks every module under `src/` and writes no binary.
@@ -37,4 +37,4 @@ novo        = ">= 0.20.2"
 # published the line becomes the registry range `^0.1.0`, which is the
 # release that carries those bodies.
 btree-nv = "^0.1.0"
-sql-engine-nv = { path = "../sql-engine-nv" }
+sql-engine-nv = "^0.1.0"

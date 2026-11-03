@@ -8,5 +8,8 @@ version = "0.1.1"
 hash = "0658ab834d4db3ec0e6224482f568a32e0174735669d1113892d4eab9ff97e18"
 
 [sql-engine-nv]
-source = "path"
-path = "../sql-engine-nv"
+source = "registry"
+url = "https://registry.novo-lang.org"
+req = "^0.1.0"
+version = "0.1.0"
+hash = "22956ab7116fb27c88bbe9e98d8ee1ec8250b7f3f4db2fd7bd80849725d6bf63"

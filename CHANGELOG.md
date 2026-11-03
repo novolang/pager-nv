@@ -4,11 +4,13 @@ Newest first.  Below `1.0.0` a breaking change bumps the **minor**
 number and a compatible one the **patch**; see [Version numbers in the
 Orbit package registry](https://novo-lang.org/docs/registry/semver.html).
 
-## Unreleased
+## 0.1.0 — 2026-11-03
 
 ### Fixed
 
 - Recovering a log in which many frames are commit records takes time linear in the log, and a checkpoint lists the distinct pages of the log in linear time.
+
+This release requires novo 0.23.0 or later.
 
 ## 0.1.0 — 2026-10-11
 
