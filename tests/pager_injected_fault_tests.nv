@@ -1,0 +1,295 @@
+// pager_injected_fault_tests.nv — the refusals a file can be made to give.
+//
+// Three faults, each of them the system's own and none of them a
+// special file:
+//
+//   a file-size limit   `setrlimit(RLIMIT_FSIZE)` makes a write that ends
+//                       past the limit answer `EFBIG`, which is the
+//                       refusal a full disk gives the code under test.
+//                       The limit is a byte position, so a test that
+//                       wants the Nth write refused sets it at the end of
+//                       the write before.
+//   a creation mask     `umask(0o477)` makes the next file this process
+//                       creates mode 0200: the call that creates it
+//                       succeeds and writes to it, and a later open of
+//                       the same path for reading is refused.
+//   a log that shrank   the file is truncated in place while the pager
+//                       holds a descriptor on it, so every read behind
+//                       the cut answers nothing.
+//
+// The three calls into libc are declared here and not in `src/`: the
+// package's modules stay free of `@ffi`, and the declarations are a
+// test's own.  Each fault is lifted before the next assertion, because
+// the runner reports through the process the fault was set on.
+//
+// The files are under /tmp and every test erases what it made.
+
+use std.test
+use std.list
+use std.ptr
+use pagefmt
+use pager
+
+@ffi(library = "c", symbol = "umask")
+fn c_umask(mask: i32) -> i32 [io, ffi]
+
+@ffi(library = "c", symbol = "setrlimit")
+fn c_setrlimit(resource: i32, limit: Int) -> i32 [io, ffi]
+
+@ffi(library = "c", symbol = "signal")
+fn c_signal(sig: i32, handler: Int) -> Int [io, ffi]
+
+fn scratch(name: Str) -> Str
+    "/tmp/pager-nv-injected-" + name + ".db"
+
+fn log_of(db: Str) -> Str
+    db + "-wal"
+
+// The file this test wrote, gone, so the next run of the suite starts
+// where this one did.  A file left at mode 0200 is made readable first,
+// because a delete does not need the mode but a leftover that no one
+// can read is a trap for the person who looks.
+fn erase(name: Str) [fs]
+    let made = scratch(name)
+    let _ = fs.set_file_mode(made, 0o600)
+    let _ = fs.set_file_mode(log_of(made), 0o600)
+    let _ = fs.delete(made)
+    let _ = fs.delete(log_of(made))
+
+// A whole page: these bytes, then zeros.
+fn padded(bytes: [Int], size: Int) -> [Int]
+    var out = list.take(bytes, size)
+    while list.len(out) < size
+        out = list.push(out, 0)
+    out
+
+// What a refusal says it was doing, or the empty text for an answer
+// that is not a refusal of the system.
+fn refused_under(e: PagerError) -> Str
+    match e
+        IoFailed(operation, _) => operation
+        _                      => ""
+
+// The creation mask this process makes files with, replaced by `mask`;
+// the answer is the mask it was.
+fn set_creation_mask(mask: Int) -> Int [io]
+    var old = 0
+    unsafe_discharge [ffi]
+        old = c_umask(mask as i32) as Int
+    old
+
+// No write may end past `bytes`, and a write that would is refused with
+// `EFBIG` instead of ending the process with SIGXFSZ.
+fn limit_file_size(bytes: Int) [io]
+    let slot = ptr.alloc(16)
+    ptr.write_word(slot, bytes)
+    ptr.write_word(slot + 8, 0 - 1)
+    var rc = 0
+    unsafe_discharge [ffi]
+        let _ = c_signal(25, 1)
+        rc = c_setrlimit(1, slot) as Int
+    ptr.free(slot)
+    let _ = rc
+
+// The limit lifted and the signal back to its default.
+fn lift_file_size_limit() [io]
+    let slot = ptr.alloc(16)
+    ptr.write_word(slot, 0 - 1)
+    ptr.write_word(slot + 8, 0 - 1)
+    var rc = 0
+    unsafe_discharge [ffi]
+        rc = c_setrlimit(1, slot) as Int
+        let _ = c_signal(25, 0)
+    ptr.free(slot)
+    let _ = rc
+
+// The first `keep` bytes of the file at `path`, and nothing after them,
+// in the same file: a descriptor already open on it sees the cut.
+fn cut_to(path: Str, keep: Int) -> Bool [fs]
+    let head = match fs.open_read(path)
+        None    =>
+            return false
+        Some(f) => f
+    let kept = if keep > 0
+        fs.read_at(head, 0, keep)
+    else
+        Some([])
+    fs.close(head)
+    match kept
+        None        =>
+            false
+        Some(bytes) =>
+            if not fs.write(path, "")
+                return false
+            if keep == 0
+                return true
+            match fs.open_write(path)
+                None    =>
+                    false
+                Some(f) =>
+                    let bad = fs.write_at(f, 0, bytes)
+                    fs.close(f)
+                    bad == None
+
+// A database with one page written and committed, its log in place, and
+// the pager that holds it.
+fn committed_database(name: Str, fill: Int) -> Result<pager.Pager, PagerError> [fs]
+    erase(name)
+    let p = pager.create(scratch(name), 4096)!
+    let open_tx = pager.begin(p)!
+    let wrote = pager.write_page(open_tx, 2, padded([fill], 4096))!
+    pager.commit(wrote)
+
+// ── a new database the file refuses ─────────────────────────────────
+
+@test
+fn test_a_new_database_whose_first_page_is_refused_is_not_created() [fs, io]
+    // The first page of a database is written whole before anything
+    // else, and a write that comes back short is a refusal.
+    erase("first-page")
+    limit_file_size(100)
+    let made = pager.create(scratch("first-page"), 512)
+    lift_file_size_limit()
+    match made
+        Ok(_)  =>
+            return test.fail("the file takes 100 bytes of a 512-byte page")
+        Err(e) =>
+            test.assert_eq(refused_under(e), "write the first page")
+    erase("first-page")
+
+@test
+fn test_a_new_database_whose_catalog_page_is_refused_is_not_created() [fs, io]
+    // The first page went in whole, and the catalog page behind it is
+    // past the limit: the refusal is reported under the catalog's name,
+    // so the first write is not blamed for the second.
+    erase("catalog-page")
+    limit_file_size(512)
+    let made = pager.create(scratch("catalog-page"), 512)
+    lift_file_size_limit()
+    match made
+        Ok(_)  =>
+            return test.fail("the file ends at the first page")
+        Err(e) =>
+            test.assert_eq(refused_under(e), "write the catalog page")
+    erase("catalog-page")
+
+@test
+fn test_a_new_database_that_cannot_be_read_back_is_a_storage_error() [fs, io]
+    // The file is created and written, and the open for reading that
+    // gives the pager its descriptor is refused: the creation mask left
+    // the file write-only.
+    erase("write-only")
+    let old = set_creation_mask(0o477)
+    let made = pager.create(scratch("write-only"), 4096)
+    let _ = set_creation_mask(old)
+    match made
+        Ok(_)  =>
+            return test.fail("the file is write-only")
+        Err(e) =>
+            test.assert_eq(refused_under(e), "open the database")
+    erase("write-only")
+
+// ── a log the file refuses ──────────────────────────────────────────
+
+@test
+fn test_a_log_that_cannot_be_read_back_is_a_storage_error() [fs, io]
+    // The log is created at the first write: its header goes in, the
+    // flush passes, and the open for reading the pager keeps is refused
+    // because the creation mask left the log write-only.
+    erase("write-only-log")
+    let p = match pager.create(scratch("write-only-log"), 4096)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    let open_tx = match pager.begin(p)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    let old = set_creation_mask(0o477)
+    let wrote = pager.write_page(open_tx, 2, padded([1], 4096))
+    let _ = set_creation_mask(old)
+    match wrote
+        Ok(_)  =>
+            return test.fail("the log is write-only")
+        Err(e) =>
+            test.assert_eq(refused_under(e), "open the log for reading")
+    let _ = pager.close(p)
+    erase("write-only-log")
+
+// ── a log that shrank under the pager ───────────────────────────────
+
+@test
+fn test_a_rollback_that_cannot_read_the_checksum_chain_back_is_a_short_read() [fs, io]
+    // A rollback goes back to the checksum the last committed frame
+    // left the chain at, and reads it out of the log.  A log that was
+    // cut to nothing under the open descriptor has no such frame.
+    let committed = match committed_database("rollback-chain", 81)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    let open_tx = match pager.begin(committed)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    test.assert_true(cut_to(log_of(scratch("rollback-chain")), 0), "the log is cut to nothing")
+    match pager.rollback(open_tx)
+        Ok(_)                        =>
+            return test.fail("there is no frame to read the chain from")
+        Err(ShortRead(_, got, want)) =>
+            test.assert_eq(got, 0)
+            test.assert_eq(want, 8)
+        Err(e)                       =>
+            return test.fail("expected a short read, got: " + e.message())
+    let _ = pager.close(committed)
+    erase("rollback-chain")
+
+@test
+fn test_a_rollback_that_cannot_read_the_header_page_back_is_a_short_read() [fs, io]
+    // The chain's two words are in the last frame's header and the
+    // database header is in its page.  A log cut inside that page lets
+    // the first read through and refuses the second, which is the other
+    // place a rollback reads the log.
+    let committed = match committed_database("rollback-header", 82)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    let open_tx = match pager.begin(committed)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    // Two frames are committed: the page, then the commit record, which
+    // is page 1 and the last.
+    let inside = pagefmt.frame_offset(4096, 1) + pagefmt.wal_frame_header_size() + 10
+    test.assert_true(cut_to(log_of(scratch("rollback-header")), inside), "the log is cut inside the last page")
+    match pager.rollback(open_tx)
+        Ok(_)                            =>
+            return test.fail("the last page is cut short")
+        Err(ShortRead(page_id, _, want)) =>
+            test.assert_eq(page_id, 1)
+            test.assert_eq(want, 4096)
+        Err(e)                           =>
+            return test.fail("expected a short read, got: " + e.message())
+    let _ = pager.close(committed)
+    erase("rollback-header")
+
+@test
+fn test_a_checkpoint_that_cannot_read_a_frame_back_leaves_the_database_alone() [fs, io]
+    // The pages are all read out of the log before the database is
+    // opened for writing, so a frame that is not there stops the
+    // checkpoint with the database file as it was.
+    let committed = match committed_database("checkpoint-read", 83)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(q)  => q
+    let before = fs.size(scratch("checkpoint-read")) ?? 0
+    test.assert_true(cut_to(log_of(scratch("checkpoint-read")), 100), "the log is cut inside its first frame")
+    match pager.checkpoint(committed)
+        Ok(_)                   =>
+            return test.fail("the frames are not in the log")
+        Err(ShortRead(_, _, _)) =>
+            test.assert_true(true, "the read of the first frame found nothing")
+        Err(e)                  =>
+            return test.fail("expected a short read, got: " + e.message())
+    test.assert_eq(fs.size(scratch("checkpoint-read")) ?? 0, before)
+    let _ = pager.close(committed)
+    erase("checkpoint-read")

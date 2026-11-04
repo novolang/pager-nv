@@ -35,15 +35,30 @@ state the design they stated then.
 
 ### Known
 
-- Line coverage of `src/` is 97.4% as the per-line maximum over the seven
-  suites, and every line below that is inside a `// cov: skip` region
-  with its reason at the site.  The regions are error arms that need the
-  system to take one call and refuse the next, or a file to shrink under
-  an open descriptor: no file a suite can name does either, because the
-  package calls `std.fs` directly.  The ones a file can provoke are
-  tested in `tests/pager_failure_tests.nv` and
-  `tests/driver_failure_tests.nv`.  `recover_log` now answers a `Pager`
-  and not a `Result`, since it had no path to an error.
+- Line coverage of `src/` is 98% as the per-line maximum over the nine
+  suites, and every line below that is inside one of eight `// cov: skip`
+  regions with its reason at the site.  Four are arms that another check
+  has already ruled out, which a match or an `if` keeps total: the decode
+  that follows an encode, the open-transaction guard before an append,
+  an empty leaf, which always fits, and the end of the row loop, which
+  pauses or finishes before it can reach its last arm.  One is the step
+  budget, a million steps, which no suite can spend.  One is the flush
+  of a regular file the call has just made and written, which fails only
+  when the disk does.  Two repeat a call that has just succeeded on the
+  same path, or read bytes the size check has just vouched for, and
+  only another process can change what they find in between.  The
+  refusals of the system that a file can provoke are tested:
+  `tests/pager_failure_tests.nv` and `tests/driver_failure_tests.nv` put
+  a device in a path, and `tests/pager_injected_fault_tests.nv` and
+  `tests/driver_injected_fault_tests.nv` refuse the Nth write with a
+  file-size limit, leave a new file write-only with a creation mask, and
+  cut the log under an open descriptor.  `recover_log` now answers a
+  `Pager` and not a `Result`, since it had no path to an error.
+- The recovery test counts read calls and not seconds: opening a log of
+  twice the frames takes twice the reads, so a scan that went back over
+  the log at every commit record would fail it.  A copy of the frame
+  list at every commit record makes no read call and is not counted by
+  it; `recover_log` takes its one copy at the end.
 
 ## 0.0.6 — 2026-09-28
 

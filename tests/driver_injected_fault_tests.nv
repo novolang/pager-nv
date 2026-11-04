@@ -1,0 +1,241 @@
+// driver_injected_fault_tests.nv — a statement the file stops taking
+// frames for part of the way through.
+//
+// driver_failure_tests.nv puts a device in the log's path, and a device
+// refuses every frame from the first.  A statement is a sequence of
+// frames, though, and the driver has an arm for the refusal of each
+// kind: the page a write request carries, the page a free puts on the
+// list, the catalog page that follows a new table's root, and the
+// rollback that follows all of them.  Here the log is a real file with
+// a size limit (`setrlimit(RLIMIT_FSIZE)`): a write that ends past the
+// limit answers `EFBIG`, which is the refusal a full disk gives.  The
+// limit is a byte position, so a limit at the end of frame N lets
+// exactly N frames in, and a statement run under each limit in turn is
+// refused at each of its frames in turn.
+//
+// A failed statement leaves the caller's pager as it was, because a
+// pager is a value; each run in a sweep starts from that same value, and
+// the frames a refused run left in the file behind the committed ones
+// are overwritten by the next.
+//
+// The two calls into libc are declared here and not in `src/`: the
+// package's modules stay free of `@ffi`, and the declarations are a
+// test's own.  The limit is lifted before the next assertion, because
+// the runner reports through the process it was set on.
+//
+// The files are under /tmp and every test erases what it made.
+
+use std.test
+use std.list
+use std.str
+use std.ptr
+use pagefmt
+use pager
+use driver
+use sqlengine
+
+@ffi(library = "c", symbol = "setrlimit")
+fn c_setrlimit(resource: i32, limit: Int) -> i32 [io, ffi]
+
+@ffi(library = "c", symbol = "signal")
+fn c_signal(sig: i32, handler: Int) -> Int [io, ffi]
+
+fn scratch(name: Str) -> Str
+    "/tmp/pager-nv-driver-injected-" + name + ".db"
+
+fn log_of(db: Str) -> Str
+    db + "-wal"
+
+fn erase(name: Str) [fs]
+    let made = scratch(name)
+    let _ = fs.delete(made)
+    let _ = fs.delete(log_of(made))
+
+// No write may end past `bytes`, and a write that would is refused with
+// `EFBIG` instead of ending the process with SIGXFSZ.
+fn limit_file_size(bytes: Int) [io]
+    let slot = ptr.alloc(16)
+    ptr.write_word(slot, bytes)
+    ptr.write_word(slot + 8, 0 - 1)
+    var rc = 0
+    unsafe_discharge [ffi]
+        let _ = c_signal(25, 1)
+        rc = c_setrlimit(1, slot) as Int
+    ptr.free(slot)
+    let _ = rc
+
+// The limit lifted and the signal back to its default.
+fn lift_file_size_limit() [io]
+    let slot = ptr.alloc(16)
+    ptr.write_word(slot, 0 - 1)
+    ptr.write_word(slot + 8, 0 - 1)
+    var rc = 0
+    unsafe_discharge [ffi]
+        rc = c_setrlimit(1, slot) as Int
+        let _ = c_signal(25, 0)
+    ptr.free(slot)
+    let _ = rc
+
+// The file at `path` cut to nothing, in the same file: a descriptor
+// already open on it sees the cut.
+fn cut_to_nothing(path: Str) -> Bool [fs]
+    fs.write(path, "")
+
+// A database whose catalog names one table, `a`, that has no tree yet,
+// and the pager that holds it; nothing when a step is refused.  The
+// table is the statement's text.
+fn table_in_the_catalog(name: Str, create: Str) -> ?pager.Pager [fs]
+    erase(name)
+    let p = match pager.create(scratch(name), 4096)
+        Err(_) =>
+            return None
+        Ok(q)  => q
+    let made = match driver.execute(p, create, [])
+        Err(_)  =>
+            return None
+        Ok(out) => out
+    let open_tx = match pager.begin(made.pager)
+        Err(_) =>
+            return None
+        Ok(q)  => q
+    let stored = match driver.store_schema(open_tx, made.schema)
+        Err(_) =>
+            return None
+        Ok(q)  => q
+    match pager.commit(stored)
+        Err(_) => None
+        Ok(q)  => Some(q)
+
+// A script of this many one-row inserts into `a (id, pad)`, each row a
+// sixth of a page, so that a few rows split the table's tree into
+// several pages and the statements over it stay short.
+fn wide_rows(n: Int) -> Str
+    let pad = str.repeat("x", 600)
+    str.join(list.map(0..n, i => "INSERT INTO a VALUES (" + str.from_int(i) + ", '" + pad + "')"), "; ")
+
+// What a statement under a limit that lets `frames` more frames in
+// came back as: the number of rows it affected, or -1 for a refusal of
+// the log, or -2 for any other outcome.
+fn run_allowing(p: pager.Pager, frames: Int, sql: Str) -> Int [fs, io]
+    limit_file_size(pagefmt.frame_offset(4096, pager.stats(p).wal_frames + frames))
+    let out = driver.execute(p, sql, [])
+    lift_file_size_limit()
+    match out
+        Ok(done) => done.rows_affected
+        Err(e)   =>
+            match e
+                Storage(_) => 0 - 1
+                _          => 0 - 2
+
+// The frames a statement needs, found by running it under limits that
+// let in more of them each time: how many refusals come before the first
+// run that finishes, or -1 when none does inside `most`.  Every run
+// before it is a refusal of the log and nothing else, which is what
+// makes the count a count of frames.
+fn refusals_before_it_finishes(p: pager.Pager, sql: Str, most: Int) -> Int [fs, io]
+    var frames = 0
+    while frames <= most
+        let got = run_allowing(p, frames, sql)
+        if got >= 0
+            return frames
+        if got == 0 - 2
+            return 0 - 1
+        frames = frames + 1
+    0 - 1
+
+@test
+fn test_a_free_the_log_refuses_after_the_writes_before_it_was_taken_is_reported() [fs, io]
+    // Emptying a table that spans several pages writes the pages that
+    // changed and frees the ones that emptied.  Under a limit at each
+    // frame in turn the refusal lands on every one of them, the frees
+    // included, and the statement is refused each time and finished on
+    // the first run that is let write all of them.
+    let p = match table_in_the_catalog("free", "CREATE TABLE a (id INTEGER, pad TEXT)")
+        None    =>
+            return test.fail("the table could not be made")
+        Some(q) => q
+    let filled = match driver.execute_script(p, wide_rows(30))
+        Err(e)  =>
+            return test.fail(e.message())
+        Ok(out) => out
+    let needed = refusals_before_it_finishes(filled.pager, "DELETE FROM a", 200)
+    test.assert_true(needed > 2, "the statement needs more than its first frames")
+    // One run short of enough is still a refusal of the log.
+    test.assert_eq(run_allowing(filled.pager, needed - 1, "DELETE FROM a"), 0 - 1)
+    // The run that is let write them all finishes and removes the rows.
+    test.assert_eq(run_allowing(filled.pager, needed, "DELETE FROM a"), 30)
+    // And the caller's pager still holds every row.
+    match driver.execute(filled.pager, "SELECT id FROM a", [])
+        Err(e)   =>
+            return test.fail(e.message())
+        Ok(rows) => test.assert_eq(list.len(rows.rows), 30)
+    let _ = pager.close(p)
+    erase("free")
+
+@test
+fn test_a_catalog_page_the_log_refuses_after_the_new_root_was_taken_is_reported() [fs, io]
+    // The first statement into a table gives it a tree: the root is
+    // written, then the catalog page that names it, in the same
+    // transaction as the rows.  A log that takes the root and refuses
+    // the catalog page ends the statement with the pager's word for it,
+    // and the table is still without a tree afterwards.
+    let p = match table_in_the_catalog("catalog", "CREATE TABLE a (id INTEGER)")
+        None    =>
+            return test.fail("the table could not be made")
+        Some(q) => q
+    let needed = refusals_before_it_finishes(p, "INSERT INTO a VALUES (1)", 20)
+    // The root, the catalog page, the row's leaf and the commit record.
+    test.assert_true(needed >= 3, "the root and the catalog page are two frames of their own")
+    test.assert_eq(run_allowing(p, 2, "INSERT INTO a VALUES (1)"), 0 - 1)
+    test.assert_eq(run_allowing(p, needed, "INSERT INTO a VALUES (1)"), 1)
+    let _ = pager.close(p)
+    erase("catalog")
+
+@test
+fn test_a_script_whose_rollback_cannot_read_the_log_hears_about_the_rollback() [fs, io]
+    // A script that fails is rolled back, and the rollback reads the
+    // checksum the last committed frame left the log at.  Here the
+    // catalog is in the database file, one row is committed in the log,
+    // and the log is then cut to nothing under the pager's descriptor:
+    // the statement fails in the engine before it reads the log, and the
+    // rollback that follows cannot read it.  The caller hears the
+    // rollback's failure and not the statement's, because a rollback
+    // that did not happen is the worse news.
+    let p = match table_in_the_catalog("rollback", "CREATE TABLE a (id INTEGER)")
+        None    =>
+            return test.fail("the table could not be made")
+        Some(q) => q
+    // The first row gives the table its tree and puts the catalog page
+    // in the log; the checkpoint moves both into the database file; the
+    // second row is the one frame that stays in the log.
+    let first = match driver.execute(p, "INSERT INTO a VALUES (1)", [])
+        Err(e)  =>
+            return test.fail(e.message())
+        Ok(out) => out
+    let moved = match pager.checkpoint(first.pager)
+        Err(e) =>
+            return test.fail(e.message())
+        Ok(c)  => c
+    let inserted = match driver.execute(moved.pager, "INSERT INTO a VALUES (2)", [])
+        Err(e)  =>
+            return test.fail(e.message())
+        Ok(out) => out
+    test.assert_true(pager.stats(inserted.pager).wal_frames > 0, "the log holds a committed frame")
+    // Before the cut, the same script fails as the engine says it does.
+    match driver.execute_script(inserted.pager, "SELECT id FROM nowhere")
+        Ok(_)          =>
+            return test.fail("there is no such table")
+        Err(Engine(_)) =>
+            test.assert_true(true, "the engine refuses the statement")
+        Err(e)         =>
+            return test.fail("expected the engine's refusal, got: " + e.message())
+    test.assert_true(cut_to_nothing(log_of(scratch("rollback"))), "the log is cut to nothing")
+    match driver.execute_script(inserted.pager, "SELECT id FROM nowhere")
+        Ok(_)           =>
+            return test.fail("there is no such table")
+        Err(Storage(_)) =>
+            test.assert_true(true, "the rollback's failure is what the caller hears")
+        Err(e)          =>
+            return test.fail("expected the rollback's failure, got: " + e.message())
+    let _ = pager.close(p)
+    erase("rollback")

@@ -3,7 +3,7 @@
 use std.test
 use std.list
 use std.fs
-use std.time
+use std.str
 use pagefmt
 use pager
 use pagefmt.{ Checksum, WalFrame, WalHeader }
@@ -52,25 +52,59 @@ fn write_log(db: Str, frames: Int) -> Bool [fs]
     fs.close(fd)
     ok
 
-@test
-fn test_a_log_of_many_commit_records_is_recovered_in_linear_time() [io, fs, time]
+// How many read calls this process has made so far, from the kernel's
+// own account of it, or -1 on a machine that keeps none.  The read of
+// the account is itself a few calls, the same few every time.
+fn reads_so_far() -> Int [fs]
+    let text = fs.read("/proc/self/io") ?? ""
+    for line in str.split(text, "\n")
+        if str.starts_with(line, "syscr: ")
+            return str.to_int(str.trim(str.slice(line, 7, str.len(line)))) ?? 0 - 1
+    0 - 1
+
+// The read calls it takes to open a database whose log holds this many
+// frames, every one of them a commit record, or -1 when a step is
+// refused or the machine keeps no account.
+fn reads_to_recover(frames: Int) -> Int [fs]
     erase()
-    let made = pager.create(scratch(), 512)
-    match made
-        Err(_) => test.fail("create")
-        Ok(p)  =>
-            let _ = pager.close(p)
-            test.assert(write_log(scratch(), 120000))
-            let started = time.now()
-            let opened = pager.open(scratch())
-            let took = time.now() - started
-            match opened
-                Err(_) => test.fail("the log is well formed")
-                Ok(q)  =>
-                    // Recovery reads 120000 frames; copying the frame list at every commit takes far longer.
-                    test.assert(took < 12.0)
-                    test.assert(pager.stats(q).wal_frames == 120000)
-                    let _ = pager.close(q)
+    let p = match pager.create(scratch(), 512)
+        Err(_) =>
+            return 0 - 1
+        Ok(q)  => q
+    let _ = pager.close(p)
+    if not write_log(scratch(), frames)
+        return 0 - 1
+    let before = reads_so_far()
+    let opened = pager.open(scratch())
+    let after = reads_so_far()
+    match opened
+        Err(_) =>
+            0 - 1
+        Ok(q)  =>
+            let counted = pager.stats(q).wal_frames
+            let _ = pager.close(q)
+            if counted != frames or before < 0 or after < 0
+                0 - 1
+            else
+                after - before
+
+@test
+fn test_a_log_of_many_commit_records_is_recovered_in_linear_work() [io, fs]
+    // The work is counted and not timed: recovery reads each frame
+    // once, so opening a log of twice the frames takes twice the read
+    // calls (and a few more for the two headers).  A scan that went
+    // back over the log at every commit record would take four times.
+    // A copy of the frame list at every record makes no read call and is
+    // not counted here: `recover_log` takes its one copy at the end.
+    if fs.exists("/proc/self/io")
+        let small = reads_to_recover(2000)
+        let large = reads_to_recover(4000)
+        test.assert(small >= 2000)
+        test.assert(small < 2000 + 16)
+        test.assert(large >= 4000)
+        test.assert(large <= 2 * small + 16)
+    else
+        test.assert_true(true, "this machine keeps no account of its read calls")
     erase()
 
 @test

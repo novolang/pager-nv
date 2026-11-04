@@ -175,11 +175,6 @@ fn answer_request(p: pager.Pager, e: sqlengine.Engine,
         PrFreePage(page_id)         =>
             let a = match free_request(p, page_id)
                 Err(cause) =>
-                    // cov: skip — a free is a frame like a write.  A log that
-                    // refuses frames refuses the write the engine asks for
-                    // before it frees the node it replaced, so that write
-                    // answers first, and no file takes one frame and
-                    // refuses the next.
                     return Err(cause)
                 Ok(a)      => a
             Ok(DriverState { pager: a.pager, engine: e })
@@ -252,9 +247,14 @@ fn drive_rows(p: pager.Pager, e: sqlengine.Engine, st: sqlengine.Statement,
         // it is looping, and the caller hears that rather than waiting
         // for a process that never returns.
         // cov: skip — the budget is a million steps, and a statement
-        // reaches it only by producing a million rows or page requests.
-        // A test that built 1100 rows and joined the table to itself did
-        // not finish inside the 300-second budget a suite is given.
+        // spends one on each row it produces and on each page it asks for.
+        // The engine ends a recursive CTE at 1001 rows, and a join runs
+        // its loops inside one step (a ten-row table joined to itself
+        // eight times, a hundred million combinations, ends without
+        // reaching the budget).  A million rows or pages is more than a
+        // suite can build and run in the 300 seconds it is given: the
+        // 1100-row table joined to itself, 1.2 million rows, did not
+        // finish inside them.
         return Err(Stalled(steps: step_budget()))
     Ok(DrivenRun { pager: state.pager, engine: state.engine, statement: current,
                    columns: sqlengine.columns(current), rows: rows,
@@ -440,10 +440,6 @@ fn split_script(sql: Str) -> [Str]
 // comes back; an error the caller cannot see is not worth reporting.
 fn failed_script(p: pager.Pager, cause: DriveError) -> Result<Executed, DriveError> [fs]
     match pager.rollback(p)
-        // cov: skip — a rollback fails only when it cannot read back the
-        // checksum the log's chain stands at, which needs the log to be
-        // shorter than the pager counted; see the same marker in
-        // pager.checksum_after_commit.
         Err(store) => Err(Storage(cause: store))
         Ok(_)      => Err(cause)
 
@@ -500,12 +496,6 @@ pub fn execute(p: pager.Pager, sql: Str, params: [btcell.Cell]) -> Result<Execut
         // table names, which is worse than the statement failing.
         q = match store_schema(q, sqlengine.schema_of(engine))
             Err(cause) =>
-                // cov: skip — store_schema refuses a schema with a view, a
-                // trigger or an index, which the catalog this schema was
-                // loaded from cannot hold; a catalog page it cannot read,
-                // which load_schema read a moment ago; and a write the log
-                // refuses, which the root page written just before it, in
-                // the same transaction and the same log, was not.
                 return Err(cause)
             Ok(next)   => next
     let run = match drive_rows(q, engine, st, 0)

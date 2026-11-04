@@ -264,6 +264,11 @@ novo test tests/pagefmt_tests.nv    # 14 tests: the two headers and the frame, b
 novo test tests/pager_tests.nv      # 19 tests: the file, the log, and recovery
 novo test tests/driver_tests.nv     # 12 tests: the page-request loop
 novo test tests/pager_edge_tests.nv # 53 tests: the wrong file, the wrong device, the catalog
+novo test tests/pager_failure_tests.nv          # 7 tests: a log or a file that behaves like a failing disk
+novo test tests/driver_failure_tests.nv         # 7 tests: the same, under a statement
+novo test tests/pager_injected_fault_tests.nv   # 7 tests: a write, an open and a read refused by the system
+novo test tests/driver_injected_fault_tests.nv  # 3 tests: the Nth frame of a statement refused
+novo test tests/hostile_tests.nv                # 2 tests: a log of commit records, counted in read calls
 ```
 
 The reference implementation is SQLite's pager and its write-ahead
@@ -293,6 +298,17 @@ takes every write and refuses every flush, `/dev/full` refuses every
 write, a mode of 000 opens for nothing, and a database file shorter
 than its header claims has no page to read. Each test names the
 operation the refusal must come back under.
+
+`pager_injected_fault_tests.nv` and `driver_injected_fault_tests.nv` make
+the system refuse a call that a device cannot. The file-size limit
+(`setrlimit`) makes a write that ends past it fail, which is what a full
+disk does, so the Nth frame of a statement can be the one that is
+refused. A creation mask (`umask`) leaves a new file write-only, so the
+open for reading that follows its creation fails. A log truncated under
+the pager's open descriptor has no frame behind the cut. The two
+suites declare the three libc calls as `@ffi` themselves, since the
+package's own modules hold no external declarations, and lift each fault
+before the next assertion.
 
 ## Licence
 
