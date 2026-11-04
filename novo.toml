@@ -31,10 +31,7 @@ novo        = ">= 0.23.0"
 # is linear and a dependency's layer may not be wider than its
 # consumer's.
 #
-# `sql-engine-nv` is wired by path while the two are developed together:
-# the registry's 0.0.6 is the interface release and every body in it is
-# a `todo()`, so `driver` cannot run against it.  Before this package is
-# published the line becomes the registry range `^0.1.0`, which is the
-# release that carries those bodies.
+# `sql-engine-nv ^0.1.0` is the release that carries the bodies `driver` runs
+# against; the registry's 0.0.6 is the interface release.
 btree-nv = "^0.1.0"
 sql-engine-nv = "^0.1.0"
